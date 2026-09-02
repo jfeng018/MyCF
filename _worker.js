@@ -944,7 +944,8 @@ function buildDailyReport(results, dateStr){
   const L = [];
   L.push('📊 MyCF 每日请求报告');
   L.push('🗓 ' + dateStr + ' (UTC)');
-  L.push('👥 ' + results.length + ' 个账号   ·   总请求 ' + fmtNum(totalReq));
+  const acctLabel = fail.length ? (ok.length + ' 个有效（共 ' + results.length + ' 个）') : (results.length + ' 个账号');
+  L.push('👥 ' + acctLabel + '   ·   总请求 ' + fmtNum(totalReq));
   L.push('════════════════════════');
   ok.forEach((r,idx)=>{
     const masked = maskEmail(r.email);
