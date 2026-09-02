@@ -136,7 +136,15 @@ async function handleRequest(request, env, ctx) {
   if (request.method === 'GET' && (p === '/' || p === '/index.html')) {
     return Response.redirect(url.origin + '/login', 302);
   }
+  // 退出（清除密码会话 cookie）
+  if (p === '/logout') {
+    return new Response('ok', {
+      headers: { 'Set-Cookie': 'cf_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0' }
+    });
+  }
   if (request.method === 'GET' && (p === '/login' || p === '/login/')) {
+    // 两级结构：未设 ACCESS_PASSWORD 时无需任何登录，直接进入主工作台
+    if (!hasPassword) return Response.redirect(url.origin + '/workers', 302);
     return new Response(renderLoginHTML(env), { headers: { 'content-type': 'text/html; charset=utf-8' } });
   }
   if (request.method === 'GET' && p.startsWith('/workers')) {
@@ -2011,17 +2019,21 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
     <div class="logo"><span style="font-size:18px">cloudflare</span>管理平台</div>
     
     <nav class="nav">
-      <div class="item active" data-page="workers" onclick="navTo('workers')">Workers管理</div>
+      <div style="font-size:11px;color:var(--muted);padding:10px 16px 2px;letter-spacing:.5px">全局 · 无需 CF 账户</div>
+      <div class="item active" data-page="overview" onclick="navTo('overview')">总览</div>
+      <div class="item" data-page="accounts" onclick="navTo('accounts')">账号库</div>
+      <div class="item" data-page="monitor" onclick="navTo('monitor')">监控中心</div>
+      <div class="item" data-page="settings" onclick="navTo('settings')">设置</div>
+      <div style="font-size:11px;color:var(--muted);padding:14px 16px 2px;letter-spacing:.5px">资源 · 按需选择执行账号</div>
+      <div class="item" data-page="workers" onclick="navTo('workers')">Workers管理</div>
       <div class="item" data-page="pages-manager" onclick="navTo('pages-manager')">Pages管理</div>
       <div class="item" data-page="snippets" onclick="navTo('snippets')">Snippets管理</div>
-      <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div>
-      <div class="item" data-page="pages" onclick="navTo('pages')">批量部署 Pages</div>
       <div class="item" data-page="kv" onclick="navTo('kv')">Workers KV</div>
       <div class="item" data-page="d1" onclick="navTo('d1')">D1 数据库</div>
       <div class="item" data-page="dns" onclick="navTo('dns')">域名管理</div>
-      <div class="item" data-page="monitor" onclick="navTo('monitor')">监控中心</div>
+      <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div>
+      <div class="item" data-page="pages" onclick="navTo('pages')">批量部署 Pages</div>
       <div class="item" data-page="bulk" onclick="navTo('bulk')">批量操作</div>
-      <div class="item" data-page="settings" onclick="navTo('settings')">设置</div>
     </nav>
     
     <div style="margin-top:auto;padding-top:20px;border-top:1px solid #eef2f6">
@@ -2043,8 +2055,73 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
   </aside>
 
   <main class="main">
+    <!-- Overview Page（全局 · 无需 CF 账户） -->
+    <div id="overview-page" class="page-content active">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">总览</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn" onclick="restoreFromKV()">从 KV 同步账号</button>
+          <button class="btn" onclick="openAccountSwitcher()">切换执行账号</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:16px">
+        <div class="metric"><div class="small">账号总数</div><div style="font-size:28px;font-weight:700" id="ovAccCount">-</div></div>
+        <div class="metric"><div class="small">有效</div><div style="font-size:28px;font-weight:700;color:#0f6e56" id="ovAccOk">-</div></div>
+        <div class="metric"><div class="small">异常 / 封号</div><div style="font-size:28px;font-weight:700;color:#a32d2d" id="ovAccBad">-</div></div>
+        <div class="metric"><div class="small">当前执行账号</div><div style="font-size:18px;font-weight:700;word-break:break-all" id="ovActive">未选择</div></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h3 style="margin:0 0 8px">使用指引</h3>
+        <div class="small" style="line-height:1.8">
+          · 全局设置（通知 / 日报 / Webhook / 加密）已鉴权即可用，无需登录任何 CF 账户。<br>
+          · 资源操作（Workers / Pages / KV / D1 / DNS 等）需先在「账号库」添加账号并设为执行账号。<br>
+          · 账号格式：邮箱 | Global API Key（可批量导入）；面板不会在 KV 之外保存凭据。
+        </div>
+      </div>
+    </div>
+
+    <!-- Accounts Page（账号库 · 全局） -->
+    <div id="accounts-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">账号库</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="accSearch" class="input list-search" placeholder="搜索账号" oninput="filterRows('accountsBox', this.value)">
+          <button class="btn primary" onclick="openAddAccount()">添加账号</button>
+          <button class="btn" onclick="openBatchImport()">批量导入</button>
+        </div>
+      </div>
+      <div class="card" style="margin-top:8px">
+        <h3 style="margin:0 0 8px">账号列表</h3>
+        <div class="small" style="margin-bottom:12px">绿色=有效，红色=异常/封号（由监控周期自动检测）。点击「设为执行账号」后即可在资源页操作该账号。</div>
+        <div id="accountsBox"></div>
+      </div>
+    </div>
+
     <!-- Workers Page -->
-    <div id="workers-page" class="page-content active">
+    <div id="workers-page" class="page-content">
+
+    <div id="addAccountModal" class="modal"><div class="modal-box">
+      <h3>添加 Cloudflare 账号</h3>
+      <div class="label">账号邮箱</div><input id="addAccEmail" class="input" placeholder="your@email.com">
+      <div class="label" style="margin-top:8px">Global API Key</div><input id="addAccKey" class="input" placeholder="全局 API 密钥">
+      <div class="label" style="margin-top:8px">分组（可选，如 main / 备用）</div><input id="addAccGroup" class="input" placeholder="main">
+      <div class="small" style="margin-top:6px">保存前会联网校验凭据有效性</div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+        <button class="btn" onclick="closeAddAccount()">取消</button>
+        <button class="btn primary" onclick="confirmAddAccount()">校验并添加</button>
+      </div>
+    </div></div>
+
+    <div id="importAccountsModal" class="modal"><div class="modal-box">
+      <h3>批量导入账号</h3>
+      <div class="small">每行一个账号，格式：邮箱|GlobalApiKey（可带第三段分组）</div>
+      <textarea id="importAccInput" class="input" style="min-height:180px;font-family:monospace;white-space:pre" placeholder="user1@example.com|key1|main&#10;user2@example.com|key2|备用"></textarea>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px">
+        <button class="btn" onclick="closeBatchImport()">取消</button>
+        <button class="btn primary" onclick="confirmBatchImport()">确认导入</button>
+      </div>
+    </div></div>
+
       <div class="header">
         <div style="font-size:20px;font-weight:700">Workers 管理</div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -2343,6 +2420,7 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <div class="small" style="margin-top:8px">
           设置后，您的 Workers 将通过 https://worker-name.your-subdomain.workers.dev 访问
         </div>
+        <div class="small" style="margin-top:8px;color:#b45309">注意：此为账户级设置，作用于当前「执行账号」的 workers.dev 子域名，需先在账号库选择执行账号。</div>
       </div>
 
       <!-- 新增：Telegram 反馈加群按钮 -->
@@ -2371,8 +2449,6 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
           <div style="margin-top:10px; font-weight:600; font-size:14px;">反馈加群</div>
         </a>
       </div>
-    </div>
-
 
     <!-- TG 推送设置 -->
     <div class="card" style="margin-top:16px">
@@ -2400,6 +2476,34 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <button class="btn" onclick="showTGWebhook()">查看 Webhook</button>
       </div>
       <div id="tgUsageBox" class="small" style="margin-top:12px;white-space:pre-wrap;font-family:monospace"></div>
+    </div>
+
+    <!-- 多通道通知（全局 · 鉴权即可用） -->
+    <div class="card" style="margin-top:16px">
+      <h3 style="margin:0">多通道通知（保活）</h3>
+      <div class="small" style="margin-top:8px">除 Telegram 外再挂一条通道（TG 在国内常被墙）。告警/日报会同时发送到所有已启用通道，任一送达即视为成功。这些配置鉴权后即可设置，与是否选择 CF 账号无关。</div>
+      <div style="margin-top:12px;display:grid;gap:10px">
+        <div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:600"><input type="checkbox" id="ndEnabled"> Discord Webhook</label>
+          <input id="ndWebhook" class="input" style="margin-top:6px" placeholder="https://discord.com/api/webhooks/...">
+        </div>
+        <div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:600"><input type="checkbox" id="nbEnabled"> Bark（iOS 推送）</label>
+          <div style="display:grid;grid-template-columns:1fr 2fr;gap:8px;margin-top:6px">
+            <input id="nbServer" class="input" placeholder="服务器(默认 api.day.app)">
+            <input id="nbKey" class="input" placeholder="DeviceKey（推送 key）">
+          </div>
+        </div>
+        <div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:600"><input type="checkbox" id="nwEnabled"> 企业微信群机器人</label>
+          <input id="nwKey" class="input" style="margin-top:6px" placeholder="webhook key（URL 中 key= 后面的值）">
+        </div>
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn primary" onclick="saveNotifyConfig()">保存通知配置</button>
+        <button class="btn" onclick="testNotify()">测试全部通道</button>
+      </div>
+    </div>
     </div>
 
     <!-- Monitor Page -->
@@ -2904,8 +3008,8 @@ function renderStaticJS(env) {
         const r = await fetch('/auth', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: pw }) });
         const res = await r.json();
         if (res.success) {
-          document.getElementById('pwOverlay').style.display = 'none';
-          await initLogin();
+          // 两级结构：密码鉴权即进入主工作台，无需先登录任何 CF 账户
+          location.replace('/workers');
         } else {
           document.getElementById('pwError').textContent = res.error || '密码错误，请重试';
           document.getElementById('pwInput').value = '';
@@ -2922,21 +3026,11 @@ function renderStaticJS(env) {
           if (ov) { ov.style.display = 'flex'; setTimeout(() => document.getElementById('pwInput').focus(), 100); }
           return;
         }
-        const res = await r.json();
-        if (res.hasKV) {
-          try {
-            const kvR = await fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'load-accounts-kv' }) });
-            const kvData = await kvR.json();
-            if (kvData.success && kvData.accounts && kvData.accounts.length) {
-              const local = loadSaved();
-              const merged = [...kvData.accounts];
-              local.forEach(a => { if (!merged.find(x => x.email === a.email)) merged.push(a); });
-              localStorage.setItem('cf_accounts', JSON.stringify(merged));
-            }
-          } catch(e) {}
-        }
+        // 会话有效（或未设密码）：直接进入主工作台
+        location.replace('/workers');
+        return;
       } catch(e) {}
-      renderSaved();
+      location.replace('/workers');
     }
     // ===== end =====
 
@@ -2961,7 +3055,10 @@ function renderStaticJS(env) {
 
     function openAccountSwitcher() {
       const arr = loadSaved(); const current = getActiveCreds(); const cont = el('accountListContainer'); cont.innerHTML = '';
-      if (arr.length === 0) { cont.innerHTML = '<div style="padding:16px;text-align:center;color:#64748b">暂无其他账号</div>'; } else {
+      if (arr.length === 0) {
+        cont.innerHTML = '<div style="padding:16px;text-align:center;color:#64748b">暂无账号</div>' +
+          '<div style="text-align:center;padding:0 16px 14px"><button class="btn small" onclick="goAccounts()">去账号库添加</button></div>';
+      } else {
         arr.forEach((acc, idx) => {
           const isActive = acc.email === current.email; const div = document.createElement('div'); div.className = 'acct-row ' + (isActive ? 'acct-active' : '');
           div.innerHTML = \`<div style="flex:1;cursor:pointer" onclick="switchAccount(\${idx})"><div style="font-weight:600;display:flex;align-items:center">\${escapeHtml(acc.email)}\${isActive ? '<span class="badge">当前</span>' : ''}</div><div class="small" style="margin-bottom:0">\${acc.added || ''}</div></div>\${!isActive ? \`<button class="trash-btn" onclick="removeAccount(\${idx})" title="移除账号">✕</button>\` : ''}\`; cont.appendChild(div);
@@ -2970,10 +3067,22 @@ function renderStaticJS(env) {
       el('accountModal').style.display = 'flex';
     }
     function switchAccount(idx) { const arr = loadSaved(); if (arr[idx]) { localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); localStorage.removeItem('cf_accountId'); showNotification('正在切换账号...'); setTimeout(() => location.reload(), 500); } }
-    function removeAccount(idx) { confirmDialog('确定移除该账号？KV 中同名账号也会一并移除。', () => { const arr = loadSaved(); arr.splice(idx, 1); saveAccounts(arr); openAccountSwitcher(); }); }
+    function removeAccount(idx) { confirmDialog('确定移除该账号？KV 中同名账号也会一并移除。', () => { const arr = loadSaved(); arr.splice(idx, 1); saveAccounts(arr); const ap = el('accounts-page'); if (ap && ap.classList.contains('active')) renderAccounts(); else openAccountSwitcher(); }); }
     function closeAccountSwitcher() { el('accountModal').style.display = 'none'; }
+    function goAccounts(){ closeAccountSwitcher(); navTo('accounts'); }
 
+    // 两级结构：资源页需要"执行账号"，未选择时先引导（不再影响全局页）
+    const RESOURCE_PAGES = ['workers','pages-manager','snippets','kv','d1','dns','batch','pages','bulk'];
+    function ensureAccount(){
+      const a = getActiveCreds();
+      if (a.email && a.key) return true;
+      showNotification('该页面需要执行账号：请先选择或添加一个 CF 账号', 'error');
+      openAccountSwitcher();
+      return false;
+    }
     function navTo(page) {
+      // 资源页需执行账号：未选择时先引导，不切换页面（全局页不受影响）
+      if (RESOURCE_PAGES.indexOf(page) !== -1 && !ensureAccount()) return;
       document.querySelectorAll('.nav .item').forEach(i => i.classList.remove('active'));
       document.querySelectorAll('.page-content').forEach(p => p.classList.remove('active'));
       const activeNav = Array.from(document.querySelectorAll('.nav .item')).find(i => i.dataset.page === page);
@@ -2981,14 +3090,130 @@ function renderStaticJS(env) {
       if (activeNav) activeNav.classList.add('active'); if (activePage) activePage.classList.add('active');
       const sb = document.querySelector('.sidebar'); if (sb) sb.classList.remove('open');
       switch(page) {
+        case 'overview': renderOverview(); break;
+        case 'accounts': renderAccounts(); break;
         case 'workers': refreshWorkers(); break;
         case 'batch': renderBatchPage(); break; case 'pages': renderPagesBatchPage(); break; case 'pages-manager': refreshPagesManager(); break;
         case 'kv': refreshKVNamespaces(); break;
         case 'd1': refreshD1Databases(); break;
         case 'dns': showZonesList(); break; case 'snippets': showSnippetsZonesList(); break;
         case 'monitor': loadMonitor(); break; case 'bulk': renderBulkAccounts(); renderBulkZones(); break;
-        case 'settings': loadSubdomainSettings(); break;
+        case 'settings': loadSettingsAll(); break;
       }
+    }
+
+    // ===== 总览 / 账号库（全局能力）=====
+    function accountStatusText(a){
+      if (!a || !a.status || a.status === 'ok') return { t:'有效', c:'#0f6e56' };
+      if (a.status === 'abnormal') return { t:'异常/封号', c:'#a32d2d' };
+      return { t:'接口错误', c:'#854F0B' };
+    }
+    async function kvMergeAccounts(){
+      try {
+        const r = await api('load-accounts-kv', {});
+        if (r && r.success && Array.isArray(r.accounts)) {
+          const cur = loadSaved(); const m = r.accounts.slice();
+          cur.forEach(a => { const i = m.findIndex(x => x.email === a.email); if (i > -1) { if (a.group && !m[i].group) m[i].group = a.group; } else m.push(a); });
+          localStorage.setItem('cf_accounts', JSON.stringify(m));
+          return m;
+        }
+      } catch(e){}
+      return loadSaved();
+    }
+    async function renderOverview(){
+      const arr = await kvMergeAccounts();
+      const ok = arr.filter(a => !a.status || a.status === 'ok').length;
+      const bad = arr.filter(a => a.status && a.status !== 'ok').length;
+      if (el('ovAccCount')) el('ovAccCount').textContent = arr.length;
+      if (el('ovAccOk')) el('ovAccOk').textContent = ok;
+      if (el('ovAccBad')) el('ovAccBad').textContent = bad;
+      const act = getActiveCreds();
+      if (el('ovActive')) el('ovActive').textContent = act.email ? maskEmailShort(act.email) : '未选择';
+    }
+    async function renderAccounts(){
+      const arr = await kvMergeAccounts();
+      const box = el('accountsBox'); if (!box) return;
+      const act = getActiveCreds();
+      box.innerHTML = '';
+      if (!arr.length) { box.innerHTML = '<div style="padding:18px;color:#64748b;text-align:center">暂无账号 —— 点击右上「添加账号」或「批量导入」</div>'; return; }
+      arr.forEach((a, idx) => {
+        const st = accountStatusText(a); const isActive = act.email === a.email;
+        const row = document.createElement('div');
+        row.className = 'worker-row';
+        row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px';
+        const left = document.createElement('div'); left.style.cssText = 'flex:1;min-width:0';
+        const emailLine = document.createElement('div'); emailLine.style.cssText = 'font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap';
+        emailLine.appendChild(document.createTextNode(a.email));
+        if (isActive) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = '执行账号'; emailLine.appendChild(b); }
+        if (a.group) { const g = document.createElement('span'); g.style.cssText = 'font-size:11px;background:#eef2ff;color:#3730a3;border-radius:4px;padding:1px 6px'; g.textContent = a.group; emailLine.appendChild(g); }
+        const st2 = document.createElement('span'); st2.style.cssText = 'font-size:11px;color:' + st.c; st2.textContent = st.t; emailLine.appendChild(st2);
+        const meta = document.createElement('div'); meta.className = 'small'; meta.style.cssText = 'margin:0;color:#94a3b8';
+        meta.textContent = (a.statusReason ? a.statusReason + ' · ' : '') + (a.added ? '添加于 ' + a.added : '');
+        left.appendChild(emailLine); left.appendChild(meta); row.appendChild(left);
+        const btns = document.createElement('div'); btns.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
+        btns.innerHTML = '<button class="btn small" onclick="setActiveAccount(' + idx + ')">设为执行账号</button>' +
+          '<button class="btn small" onclick="editAccountGroup(' + idx + ')">分组</button>' +
+          '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="removeAccount(' + idx + ')">移除</button>';
+        row.appendChild(btns); box.appendChild(row);
+      });
+    }
+    function openAddAccount(){ el('addAccEmail').value=''; el('addAccKey').value=''; el('addAccGroup').value=''; el('addAccountModal').style.display='flex'; }
+    function closeAddAccount(){ el('addAccountModal').style.display='none'; }
+    async function confirmAddAccount(){
+      const email = el('addAccEmail').value.trim(); const key = el('addAccKey').value.trim();
+      const group = el('addAccGroup').value.trim();
+      if (!email || !key) return showNotification('请输入邮箱和 API Key', 'error');
+      const r = await api('validate-credentials', { email, key });
+      if (!r || !(r.result || r.success === true)) return showNotification('校验失败：' + ((r && (r.errors || r.message || r.error)) || '凭据无效'), 'error');
+      const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\\//g, '-');
+      const arr = loadSaved(); const i = arr.findIndex(x => x.email === email);
+      const acc = { email, key, added: now }; if (group) acc.group = group;
+      if (i !== -1) arr[i] = acc; else arr.unshift(acc);
+      saveAccounts(arr);
+      localStorage.setItem('cf_active_email', email); localStorage.setItem('cf_active_key', key);
+      updateAcctBadge(); closeAddAccount(); showNotification('已添加并设为执行账号');
+      setTimeout(() => location.reload(), 400);
+    }
+    function openBatchImport(){ el('importAccInput').value=''; el('importAccountsModal').style.display='flex'; }
+    function closeBatchImport(){ el('importAccountsModal').style.display='none'; }
+    function confirmBatchImport(){
+      const raw = el('importAccInput').value || ''; if (!raw.trim()) return showNotification('请输入内容', 'error');
+      const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\\//g, '-');
+      const cur = loadSaved(); let n = 0;
+      raw.split('\\n').forEach(line => {
+        const parts = line.split('|');
+        if (parts.length >= 2) {
+          const email = parts[0].trim(); const key = parts[1].trim(); const group = (parts[2] || '').trim();
+          if (!email || !key) return;
+          const acc = { email, key, added: now }; if (group) acc.group = group;
+          const i = cur.findIndex(c => c.email === email); if (i !== -1) cur[i] = acc; else cur.unshift(acc); n++;
+        }
+      });
+      if (!n) return showNotification('未解析到有效账号（邮箱|GlobalKey）', 'error');
+      saveAccounts(cur); closeBatchImport();
+      showNotification('已导入 ' + n + ' 个账号');
+      renderAccounts();
+    }
+    function editAccountGroup(idx){
+      const arr = loadSaved(); if (!arr[idx]) return;
+      const g = prompt('设置分组（可为空）：', arr[idx].group || '');
+      if (g === null) return;
+      arr[idx].group = g.trim(); saveAccounts(arr); renderAccounts();
+    }
+    function setActiveAccount(idx){
+      const arr = loadSaved(); if (!arr[idx]) return;
+      localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key);
+      localStorage.removeItem('cf_accountId'); updateAcctBadge(); showNotification('已切换执行账号');
+      renderAccounts();
+    }
+    async function loadSettingsAll(){
+      loadSubdomainSettings();
+      try { const r = await api('load-tg-config', {}); if (r && r.success && r.config) {
+        if (r.config.botTokenSet) el('tgBotToken').placeholder = '已保存 (' + r.config.botToken + ')';
+        if (r.config.chatId) el('tgChatId').value = r.config.chatId;
+        el('tgEnabled').checked = r.config.enabled !== false; el('tgDaily').checked = r.config.dailyReport !== false; el('tgAlerts').checked = r.config.alerts !== false;
+      } } catch(e){}
+      try { const r = await api('load-notify-config', {}); if (r && r.success && r.config) { fillNotifyConfig(r.config); } } catch(e){}
     }
 
     // ===== UI 增强：账号徽标 / 暗色 / 抽屉 / 确认弹窗 / 搜索排序 / 键盘 =====
@@ -3011,7 +3236,7 @@ function renderStaticJS(env) {
       const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       if (e.key === '/') { const s = document.querySelector('.list-search'); if (s) { e.preventDefault(); s.focus(); } return; }
       if (e.key === 'g') { window.__gNext = true; setTimeout(() => window.__gNext = false, 1000); return; }
-      if (window.__gNext) { window.__gNext = false; const map = { w:'workers', d:'dns', k:'kv', i:'d1', m:'monitor', b:'bulk', s:'settings', p:'pages-manager', n:'snippets' }; const pg = map[e.key.toLowerCase()]; if (pg) navTo(pg); }
+      if (window.__gNext) { window.__gNext = false; const map = { w:'workers', d:'dns', k:'kv', i:'d1', m:'monitor', b:'bulk', s:'settings', p:'pages-manager', n:'snippets', o:'overview', a:'accounts' }; const pg = map[e.key.toLowerCase()]; if (pg) navTo(pg); }
     });
     (function initApp(){
       updateAcctBadge();
@@ -3022,16 +3247,17 @@ function renderStaticJS(env) {
             if (d.success && d.accounts && d.accounts.length) {
               const local = loadSaved(); const merged = d.accounts.slice(); local.forEach(a => { if (!merged.find(x => x.email === a.email)) merged.push(a); });
               localStorage.setItem('cf_accounts', JSON.stringify(merged));
-              localStorage.setItem('cf_active_email', merged[0].email); localStorage.setItem('cf_active_key', merged[0].key);
-              updateAcctBadge(); showNotification('已从 KV 恢复 ' + merged.length + ' 个账号');
+              updateAcctBadge();
             }
           }).catch(()=>{});
+      } else {
+        window.__kvRestorePromise = Promise.resolve();
       }
     })();
 
     function renderBatchPage() {
         const arr = loadSaved(); const list = el('batchAccountList'); list.innerHTML = '';
-        if (arr.length === 0) { list.innerHTML = '<div style="padding:10px;color:#999">请先在登录页添加账号</div>'; return; }
+        if (arr.length === 0) { list.innerHTML = '<div style="padding:10px;color:#999">请先在「账号库」添加账号</div>'; return; }
         arr.forEach((acc, idx) => {
             const div = document.createElement('div'); div.className = 'account-check-item';
             div.innerHTML = \`<label style="flex:1;cursor:pointer;display:flex;align-items:center"><input type="checkbox" class="batch-acc-chk" value="\${idx}" style="margin-right:8px"><span style="font-size:13px">\${escapeHtml(acc.email)}</span></label>\`; list.appendChild(div);
@@ -3722,6 +3948,31 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       const r = await api('push-tg-test', {});
       if(r && r.success) showNotification('测试消息已发送，请查看 TG'); else showNotification((r&&r.error)||'发送失败','error');
     }
+    // ===== P0-B 多通道通知（全局）=====
+    function fillNotifyConfig(cfg){
+      cfg = cfg || {};
+      const d = cfg.discord || {}, b = cfg.bark || {}, w = cfg.wecom || {};
+      if (el('ndEnabled')) el('ndEnabled').checked = !!d.enabled;
+      if (el('ndWebhook')) el('ndWebhook').value = d.webhook || '';
+      if (el('nbEnabled')) el('nbEnabled').checked = !!b.enabled;
+      if (el('nbKey')) el('nbKey').value = b.deviceKey || '';
+      if (el('nbServer')) el('nbServer').value = b.server || '';
+      if (el('nwEnabled')) el('nwEnabled').checked = !!w.enabled;
+      if (el('nwKey')) el('nwKey').value = w.key || '';
+    }
+    async function saveNotifyConfig(){
+      const config = {
+        discord: { enabled: el('ndEnabled').checked, webhook: el('ndWebhook').value.trim() },
+        bark: { enabled: el('nbEnabled').checked, deviceKey: el('nbKey').value.trim(), server: el('nbServer').value.trim() },
+        wecom: { enabled: el('nwEnabled').checked, key: el('nwKey').value.trim() }
+      };
+      const r = await api('save-notify-config', { config });
+      if (r && r.success) showNotification('通知配置已保存'); else showNotification((r && r.error) || '保存失败', 'error');
+    }
+    async function testNotify(){
+      const r = await api('push-tg-test', {});
+      if (r && r.success) showNotification('测试消息已发送到全部启用通道'); else showNotification((r && r.error) || '发送失败', 'error');
+    }
     async function pushTGNow(){
       const r = await api('push-tg-now', {});
       if(r && r.success) showNotification('日报已推送'); else showNotification((r&&r.error)||'推送失败','error');
@@ -3870,18 +4121,32 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     (async function init() {
       let creds = getActiveCreds();
       if (!creds.email || !creds.key) {
-        // 等 KV 恢复完成再决定是否跳登录页，避免"KV 里有账号却被弹回登录页"
+        // 等 KV 恢复完成：把账号库并进本地，但不强制激活任何账号
         try { await (window.__kvRestorePromise || Promise.resolve()); } catch(e){}
         creds = getActiveCreds();
-        if (!creds.email || !creds.key) { location.href = '/login'; return; }
+        if (!creds.email || !creds.key) {
+          // 两级结构：无执行账号也可使用全局页（总览/监控中心/账号库/设置）
+          updateAcctBadge(); navTo('overview'); return;
+        }
       }
       el('acctInfo').textContent = creds.email; updateAcctBadge();
-      setTimeout(() => { try { refreshWorkers(); } catch(e) { console.log(e); } }, 300);
+      navTo('overview');
+      setTimeout(() => { try { if (getActiveCreds().email) refreshWorkers(); } catch(e) { console.log(e); } }, 300);
     })();
 
     window.navTo = navTo;
-    window.logout = function() { localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); location.href = '/login'; };
+    window.logout = function() {
+      localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key');
+      // 同时清掉密码会话，否则 /login 会因会话有效自动跳回面板
+      fetch('/logout').catch(()=>{}).finally(() => { location.href = '/login'; });
+    };
     window.openAccountSwitcher = openAccountSwitcher; window.closeAccountSwitcher = closeAccountSwitcher;
+    window.goAccounts = goAccounts;
+    window.renderOverview = renderOverview; window.renderAccounts = renderAccounts;
+    window.openAddAccount = openAddAccount; window.closeAddAccount = closeAddAccount; window.confirmAddAccount = confirmAddAccount;
+    window.openBatchImport = openBatchImport; window.closeBatchImport = closeBatchImport; window.confirmBatchImport = confirmBatchImport;
+    window.editAccountGroup = editAccountGroup; window.setActiveAccount = setActiveAccount;
+    window.saveNotifyConfig = saveNotifyConfig; window.testNotify = testNotify;
     window.switchAccount = switchAccount; window.removeAccount = removeAccount;
     window.filterRows = filterRows; window.sortTable = sortTable; window.restoreFromKV = restoreFromKV;
     window.toggleDark = toggleDark; window.toggleSidebar = toggleSidebar;
