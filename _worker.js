@@ -17,12 +17,13 @@ export default {
   async scheduled(event, env, ctx) {
     try {
       const cron = event.cron || '';
-      // 每日 UTC 23:55 推当日请求日报（北京时间 07:55，配额 UTC 重置前）
+      // 每日 UTC 23:55：监控巡检（历史/存储/资产/证书/心跳）+ 当日请求日报（北京时间 07:55，配额 UTC 重置前）
       if (cron === '55 23 * * *') {
+        await runDailyMonitoring(env);
         await pushDailyReport(env);
       } else {
-        // 其余触发（每 4 小时）= 配额阈值告警检查
-        await checkQuotaAlerts(env);
+        // 其余触发（每 4 小时）= 探活 + WAF + 配额告警 + 心跳校验
+        await runProbeMonitoring(env);
       }
     } catch (e) {
       console.error('scheduled error', e);
@@ -756,6 +757,78 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         return json({ success:true, date: new Date().toISOString().slice(0,10), results });
       }
 
+      // ================= 监控中心 actions（走 KV 凭据，免登录校验） =================
+      case 'get-usage-trend': {
+        let history = {}; try { const r = await kvGet(env,'usage_history'); if(r) history = JSON.parse(r)||{}; } catch(e){}
+        const credsN = (await loadKVAccounts(env)).length;
+        return json({ success:true, trend: computeUsageTrend(history, 30), prediction: predictExhaustion(history, credsN) });
+      }
+      case 'run-monitor-now': {
+        await runDailyMonitoring(env);
+        await runProbeMonitoring(env);
+        return json({ success:true, message:'监控巡检已执行，数据已刷新' });
+      }
+      case 'get-asset-audit': {
+        let snap = null; try { const r = await kvGet(env,'asset_snapshot'); if(r) snap = JSON.parse(r); } catch(e){}
+        return json({ success:true, snapshot: snap });
+      }
+      case 'get-storage-usage': {
+        let data = []; try { const r = await kvGet(env,'storage_usage'); if(r) data = JSON.parse(r)||[]; } catch(e){}
+        return json({ success:true, data });
+      }
+      case 'get-health-probe': {
+        let results = []; try { const r = await kvGet(env,'health_probe'); if(r) results = JSON.parse(r)||[]; } catch(e){}
+        return json({ success:true, results });
+      }
+      case 'get-cert-expiry': {
+        let certs = []; try { const r = await kvGet(env,'cert_expiry'); if(r) certs = JSON.parse(r)||[]; } catch(e){}
+        return json({ success:true, certs });
+      }
+      case 'get-waf-status': {
+        let waf = []; try { const r = await kvGet(env,'waf_status'); if(r) waf = JSON.parse(r)||[]; } catch(e){}
+        return json({ success:true, waf });
+      }
+      case 'get-audit-log': {
+        let log = []; try { const r = await kvGet(env,'audit_log'); if(r) log = JSON.parse(r)||[]; } catch(e){}
+        return json({ success:true, log });
+      }
+      // ================= 批量操作（需当前登录凭据） =================
+      case 'bulk-deploy': {
+        const { scriptName, scriptSource, targets } = payload;
+        if (!scriptName || !Array.isArray(targets) || !targets.length) return json({ success:false, error:'scriptName 与 targets 必填' }, 400);
+        const results = [];
+        for(const t of targets){
+          try { const r = await deployWorkerTo(t.email, t.key, t.accountId, scriptName, scriptSource, payload.metadataBindings, payload.usage_model); results.push({ accountId:t.accountId, ok:r.success, message:r.message }); }
+          catch(e){ results.push({ accountId:t.accountId, ok:false, message:String(e) }); }
+        }
+        await writeAudit(env, { action:'bulk-deploy', scriptName, count:targets.length, results });
+        return json({ success:true, results });
+      }
+      case 'bulk-purge': {
+        const { zoneIds, email, key, files, everything } = payload;
+        if (!Array.isArray(zoneIds) || !zoneIds.length) return json({ success:false, error:'zoneIds 必填' }, 400);
+        if (!email || !key) return json({ success:false, error:'email/key 必填' }, 400);
+        const results = [];
+        for(const zid of zoneIds){
+          try { const r = await cfPost('/zones/'+zid+'/purge_cache', email, key, everything ? { purge_everything:true } : { files: files||[] }); results.push({ zoneId:zid, ok:r.success, message:r.errors?.[0]?.message }); }
+          catch(e){ results.push({ zoneId:zid, ok:false, message:String(e) }); }
+        }
+        await writeAudit(env, { action:'bulk-purge', count:zoneIds.length, results });
+        return json({ success:true, results });
+      }
+      case 'bulk-dns': {
+        const { zoneIds, email, key, paused } = payload;
+        if (!Array.isArray(zoneIds) || !zoneIds.length) return json({ success:false, error:'zoneIds 必填' }, 400);
+        if (!email || !key) return json({ success:false, error:'email/key 必填' }, 400);
+        const results = [];
+        for(const zid of zoneIds){
+          try { const zr = await cfGet('/zones/'+zid, email, key); const zone = zr.success ? zr.result : null; if(zone){ const up = await cfPut('/zones/'+zid, email, key, { paused: !!paused }); results.push({ zoneId:zid, ok:up.success }); } else results.push({ zoneId:zid, ok:false, message:'zone 不存在' }); }
+          catch(e){ results.push({ zoneId:zid, ok:false, message:String(e) }); }
+        }
+        await writeAudit(env, { action:'bulk-dns', paused:!!paused, count:zoneIds.length, results });
+        return json({ success:true, results });
+      }
+
       default:
         return json({ success:false, error:'unknown action' },400);
     }
@@ -930,6 +1003,268 @@ async function checkQuotaAlerts(env){
   }
   if(toSend.length) await sendTelegram(env, toSend.join('\n\n'));
   if(env && env.CF_ACCOUNTS_KV) await env.CF_ACCOUNTS_KV.put('tg_quota_alert', JSON.stringify(state));
+}
+
+// ==================== 监控模块（P0+P1） ====================
+async function kvGet(env, key){ if(!env || !env.CF_ACCOUNTS_KV) return null; const r = await env.CF_ACCOUNTS_KV.get(key); return r; }
+async function kvPut(env, key, val){ if(!env || !env.CF_ACCOUNTS_KV) return; await env.CF_ACCOUNTS_KV.put(key, typeof val==='string'?val:JSON.stringify(val)); }
+
+// ---- P0-1 用量历史趋势 + 耗尽预测 ----
+async function storeDailySnapshots(env){
+  const creds = await loadKVAccounts(env);
+  if(!creds.length) return;
+  const date = new Date().toISOString().slice(0,10);
+  let history = {}; try { const raw = await kvGet(env,'usage_history'); if(raw) history = JSON.parse(raw)||{}; } catch(e){}
+  const dayMap = history[date] || [];
+  for(const c of creds){
+    try { const list = await queryAllUsageForCred(env, c); for(const u of list){ if(u.error) continue; dayMap.push({ email:c.email, accountId:u.accountId, name:u.name||'', total:u.total, workers:u.workers, pages:u.pages }); } }
+    catch(e){}
+  }
+  history[date] = dayMap;
+  const keys = Object.keys(history).sort(); while(keys.length > 60) delete history[keys.shift()];
+  await kvPut(env,'usage_history', history);
+}
+function computeUsageTrend(history, days){
+  const dates = Object.keys(history||{}).sort().slice(-days);
+  return dates.map(d => ({ date:d, total:(history[d]||[]).reduce((t,r)=>t+(r.total||0),0) }));
+}
+function predictExhaustion(history, numAccounts){
+  const series = computeUsageTrend(history, 14);
+  if(series.length < 3) return null;
+  const n = series.length, xs = series.map((_,i)=>i), ys = series.map(s=>s.total);
+  const mx = xs.reduce((a,b)=>a+b,0)/n, my = ys.reduce((a,b)=>a+b,0)/n;
+  let num=0, den=0; for(let i=0;i<n;i++){ num += (xs[i]-mx)*(ys[i]-my); den += (xs[i]-mx)**2; }
+  const slope = den ? num/den : 0;
+  if(slope <= 0) return { trend:'稳定/下降', dailyGrowth:0, daysToLimit:null };
+  const cap = Math.max(100000, (numAccounts||1)*100000);
+  const remaining = cap - ys[n-1];
+  if(remaining <= 0) return { trend:'已达上限', dailyGrowth:Math.round(slope), daysToLimit:0, eta:new Date().toISOString().slice(0,10) };
+  const days = Math.floor(remaining/slope);
+  return { trend:'上升', dailyGrowth:Math.round(slope), daysToLimit:days, eta:new Date(Date.now()+days*86400000).toISOString().slice(0,10) };
+}
+
+// ---- P0-2 账号存活 + 资产变更审计 ----
+async function snapshotAssets(env){
+  const creds = await loadKVAccounts(env);
+  const snap = { ts: Date.now(), accounts: {} };
+  for(const c of creds){
+    try {
+      const ar = await cfGet('/accounts', c.email, c.key);
+      if(!ar.success){ snap.accounts[c.email] = { error:'凭据失效/403', alive:false }; continue; }
+      const entry = { alive:true, accounts: [] };
+      for(const a of (ar.result||[])){
+        let workers=[]; try { const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, c.key); workers = (wr.success&&wr.result)?wr.result.map(w=>w.id):[]; } catch(e){}
+        let zones=[]; try { const zr = await cfGet('/zones?account.id='+a.id, c.email, c.key); zones = (zr.success&&zr.result)?zr.result.map(z=>({id:z.id,name:z.name,status:z.status})):[]; } catch(e){}
+        entry.accounts.push({ id:a.id, name:a.name, workers, zones });
+      }
+      snap.accounts[c.email] = entry;
+    } catch(e){ snap.accounts[c.email] = { error:String(e), alive:false }; }
+  }
+  return snap;
+}
+function diffAssets(prev, cur){
+  const changes = [];
+  const emails = new Set([...Object.keys(prev.accounts||{}), ...Object.keys(cur.accounts||{})]);
+  for(const e of emails){
+    const p = prev.accounts?.[e], c = cur.accounts?.[e];
+    if(!p && c){ changes.push({ type:'cred_added', email:e }); continue; }
+    if(p && !c){ changes.push({ type:'cred_removed', email:e }); continue; }
+    if(p && c){
+      if(p.alive && !c.alive) changes.push({ type:'cred_dead', email:e, detail:c.error||'' });
+      else if(!p.alive && c.alive) changes.push({ type:'cred_recovered', email:e });
+      else if(p.alive && c.alive){
+        const pmap = Object.fromEntries((p.accounts||[]).map(a=>[a.id,a]));
+        const cmap = Object.fromEntries((c.accounts||[]).map(a=>[a.id,a]));
+        for(const aid of new Set([...Object.keys(pmap),...Object.keys(cmap)])){
+          const pa = pmap[aid], ca = cmap[aid];
+          if(!pa){ changes.push({type:'account_added',email:e,name:ca.name}); continue; }
+          if(!ca){ changes.push({type:'account_removed',email:e,name:pa.name}); continue; }
+          const pw = new Set(pa.workers||[]), cw = new Set(ca.workers||[]);
+          for(const w of cw) if(!pw.has(w)) changes.push({type:'worker_added',email:e,account:ca.name,worker:w});
+          for(const w of pw) if(!cw.has(w)) changes.push({type:'worker_removed',email:e,account:pa.name,worker:w});
+          if(pa.workers?.length && ca.workers?.length && ca.workers.length <= pa.workers.length*0.5) changes.push({type:'worker_drop',email:e,account:ca.name,from:pa.workers.length,to:ca.workers.length});
+          const pzm = Object.fromEntries((pa.zones||[]).map(z=>[z.id,z])), czm = Object.fromEntries((ca.zones||[]).map(z=>[z.id,z]));
+          for(const zid of Object.keys(czm)){ if(pzm[zid] && pzm[zid].status!==czm[zid].status) changes.push({type:'zone_status',email:e,name:czm[zid].name,from:pzm[zid].status,to:czm[zid].status}); }
+        }
+      }
+    }
+  }
+  return changes;
+}
+function auditLabel(c){
+  switch(c.type){
+    case 'cred_dead': return '凭据失效: '+maskEmail(c.email)+(c.detail?' ('+c.detail+')':'');
+    case 'cred_recovered': return '凭据恢复: '+maskEmail(c.email);
+    case 'cred_removed': return '凭据移除: '+maskEmail(c.email);
+    case 'cred_added': return '凭据新增: '+maskEmail(c.email);
+    case 'account_added': return '账号新增['+maskEmail(c.email)+'] '+c.name;
+    case 'account_removed': return '账号移除['+maskEmail(c.email)+'] '+c.name;
+    case 'worker_added': return '新增Worker['+c.account+'] '+c.worker;
+    case 'worker_removed': return '删除Worker['+c.account+'] '+c.worker;
+    case 'worker_drop': return 'Worker数量骤降['+c.account+'] '+c.from+'→'+c.to;
+    case 'zone_status': return 'Zone状态['+c.name+'] '+c.from+'→'+c.to;
+    default: return c.type;
+  }
+}
+function buildAssetAuditMsg(changes){
+  const L = ['🔍 资产变更审计 (' + changes.length + ' 项)'];
+  for(const c of changes.slice(0,30)) L.push('• ' + auditLabel(c));
+  if(changes.length>30) L.push('…共 '+changes.length+' 项');
+  return L.join('\n');
+}
+
+// ---- P0-3 存储限额监控（D1 库数 / R2 操作 / KV 操作） ----
+const STORAGE_QUERY = `query S($accountId:String!){viewer{accounts(filter:{accountTag:$accountId}){r2AggregateAnalytics(limit:1,filter:{}){sum{requests}}kvOperationsAdaptive(limit:1,filter:{}){sum{requests}}}}}`;
+async function queryStorageUsage(env){
+  const creds = await loadKVAccounts(env); const out = [];
+  for(const c of creds){
+    try {
+      const ar = await cfGet('/accounts', c.email, c.key); if(!ar.success){ out.push({email:c.email, error:true}); continue; }
+      for(const a of (ar.result||[])){
+        let d1Count=0; try { const r = await cfGet('/accounts/'+a.id+'/d1/database', c.email, c.key); d1Count = (r.success&&r.result)?r.result.length:0; } catch(e){}
+        let r2Ops=0, kvOps=0;
+        try { const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:{'Content-Type':'application/json','X-Auth-Email':c.email,'X-Auth-Key':c.key}, body: JSON.stringify({ query: STORAGE_QUERY, variables:{ accountId:a.id } }) }); const res = await g.json(); const vr = res?.data?.viewer?.accounts?.[0]; r2Ops = vr?.r2AggregateAnalytics?.[0]?.sum?.requests||0; kvOps = vr?.kvOperationsAdaptive?.[0]?.sum?.requests||0; } catch(e){}
+        out.push({ email:c.email, accountId:a.id, name:a.name, d1Count, r2Ops, kvOps });
+      }
+    } catch(e){ out.push({ email:c.email, error:String(e) }); }
+  }
+  return out;
+}
+async function storeStorageUsage(env){ await kvPut(env,'storage_usage', await queryStorageUsage(env)); }
+
+// ---- P0-4 外部 HTTP 探活 ----
+async function probeEndpoints(env){
+  const creds = await loadKVAccounts(env); const results = [];
+  for(const c of creds){
+    try {
+      const ar = await cfGet('/accounts', c.email, c.key); if(!ar.success) continue;
+      for(const a of (ar.result||[])){
+        try {
+          const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, c.key);
+          const workers = (wr.success&&wr.result)?wr.result:[];
+          for(const w of workers.slice(0,3)){
+            const sd = (w.defaultDomain&&w.defaultDomain.hostname) || (w.domains&&w.domains[0]&&w.domains[0].hostname);
+            if(!sd) continue;
+            const url = 'https://'+sd; const t0 = Date.now();
+            let status=-1, ok=false, ms=0;
+            try { const ctrl = new AbortController(); const to = setTimeout(()=>ctrl.abort(), 8000); const pr = await fetch(url, { method:'GET', redirect:'manual', signal:ctrl.signal }); clearTimeout(to); ms = Date.now()-t0; status = pr.status; ok = pr.status>=200 && pr.status<400; }
+            catch(e){ status=-1; ok=false; ms = Date.now()-t0; }
+            results.push({ email:c.email, account:a.name, worker:w.id, url, status, ok, ms });
+          }
+        } catch(e){}
+      }
+    } catch(e){}
+  }
+  return results;
+}
+function buildProbeMsg(down){
+  const L = ['🌐 端点探活异常 (' + down.length + ' 项)'];
+  for(const d of down) L.push('• ' + (d.worker||'') + ' [' + d.account + '] ' + d.url + ' => ' + (d.status<0?'超时':d.status) + (d.ms?(' '+d.ms+'ms'):''));
+  return L.join('\n');
+}
+
+// ---- P1-6 证书到期监控 ----
+async function checkCertExpiry(env){
+  const creds = await loadKVAccounts(env); const out = [];
+  for(const c of creds){
+    try {
+      const zr = await cfGet('/zones', c.email, c.key); if(!zr.success) continue;
+      for(const z of (zr.result||[])){
+        try {
+          const cr = await cfGet('/zones/'+z.id+'/ssl/certificate_packs', c.email, c.key);
+          const packs = (cr.success&&cr.result)?cr.result:[];
+          let minDays=null;
+          for(const p of packs){ for(const crt of (p.certificates||[])){ if(crt.expires_on){ const d = Math.ceil((new Date(crt.expires_on)-Date.now())/86400000); if(minDays===null||d<minDays) minDays=d; } } }
+          out.push({ email:c.email, zone:z.name, zoneId:z.id, days:minDays });
+        } catch(e){}
+      }
+    } catch(e){}
+  }
+  return out;
+}
+function buildCertMsg(due){
+  const L = ['🔐 SSL 证书即将到期'];
+  for(const c of due) L.push('• ' + c.zone + ' (' + maskEmail(c.email) + '): ' + (c.days!=null?c.days+' 天':'未知'));
+  return L.join('\n');
+}
+
+// ---- P1-7 WAF 异常流量告警 ----
+async function checkWaf(env){
+  const creds = await loadKVAccounts(env); const out = [];
+  for(const c of creds){
+    try {
+      const zr = await cfGet('/zones', c.email, c.key);
+      for(const z of (zr.result||[])){
+        try {
+          const end = new Date().toISOString(); const start = new Date(Date.now()-86400000).toISOString();
+          const q = `query W($zone:String!,$f:ZoneFirewallEventsFilter_InputObject){viewer{zones(filter:{zoneTag:$zone}){firewallEventsAdaptiveGroups(limit:1,filter:$f){sum{requests}}}}}`;
+          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:{'Content-Type':'application/json','X-Auth-Email':c.email,'X-Auth-Key':c.key}, body: JSON.stringify({ query:q, variables:{ zone:z.id, f:{ datetime_geq:start, datetime_leq:end } } }) });
+          const res = await g.json(); const cnt = res?.data?.viewer?.zones?.[0]?.firewallEventsAdaptiveGroups?.[0]?.sum?.requests || 0;
+          out.push({ email:c.email, zone:z.name, blocked:cnt });
+        } catch(e){}
+      }
+    } catch(e){}
+  }
+  return out;
+}
+function buildWafMsg(sp){
+  const L = ['🛡️ WAF 拦截突增 (' + sp.length + ' 项)'];
+  for(const w of sp) L.push('• ' + w.zone + ' (' + maskEmail(w.email) + '): 24h 拦截 ' + fmtNum(w.blocked));
+  return L.join('\n');
+}
+
+// ---- P1-8 Cron 心跳 ----
+async function heartbeat(env){ await kvPut(env,'tg_cron_heartbeat', { last: Date.now(), iso: new Date().toISOString() }); }
+
+// ---- P1-9 审计日志 ----
+async function writeAudit(env, entry){
+  let arr = []; try { const r = await kvGet(env,'audit_log'); if(r) arr = JSON.parse(r)||[]; } catch(e){}
+  arr.unshift(Object.assign({ ts: new Date().toISOString() }, entry));
+  if(arr.length > 200) arr.length = 200;
+  await kvPut(env,'audit_log', arr);
+}
+
+// ---- 批量部署工具 ----
+async function deployWorkerTo(email, key, accountId, scriptName, scriptSource, metadataBindings, usage_model) {
+  if (!accountId) accountId = await getAccountId(email, key);
+  const finalScript = (typeof scriptSource === 'string' && scriptSource.trim()) ? scriptSource : "export default { async fetch() { return new Response('Deployed via MyCF'); } };";
+  const bindings = (metadataBindings||[]).map(b => { const c = JSON.parse(JSON.stringify(b)); if(c.type==='kv_namespace'){ if(c.namespace){ c.namespace_id=c.namespace; delete c.namespace; } if(!c.namespace_id&&c.id) c.namespace_id=c.id; delete c.id; } if(c.type==='d1_database'||c.type==='d1'){ c.type='d1'; if(c.database_id){ c.id=c.database_id; delete c.database_id; } } return c; });
+  const isModule = finalScript.includes('export default') || finalScript.includes('export {');
+  const metadata = { bindings, usage_model: usage_model||'standard', placement:{mode:'smart'}, compatibility_date: new Date().toISOString().slice(0,10) };
+  const form = new FormData();
+  if(isModule){ metadata.main_module='worker.js'; form.append('metadata', JSON.stringify(metadata)); form.append('worker.js', new Blob([finalScript],{type:'application/javascript+module'}),'worker.js'); }
+  else { metadata.body_part='script'; form.append('metadata', JSON.stringify(metadata)); form.append('script', new Blob([finalScript],{type:'application/javascript'}),'worker.js'); }
+  const resp = await fetch(`${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`, { method:'PUT', headers:{'X-Auth-Email':email,'X-Auth-Key':key}, body: form });
+  const text = await resp.text().catch(()=>'{}');
+  let res; try { res = JSON.parse(text); } catch { res = { errors:[{message:text}] }; }
+  return { success: resp.ok, message: resp.ok?'OK':(res.errors?.[0]?.message||'fail') };
+}
+
+// ---- 编排 ----
+async function runDailyMonitoring(env){
+  const cfg = await getTGConfig(env);
+  await storeDailySnapshots(env);
+  await storeStorageUsage(env);
+  const cur = await snapshotAssets(env);
+  let prev = null; try { const r = await kvGet(env,'asset_snapshot'); if(r) prev = JSON.parse(r); } catch(e){}
+  if(prev && prev.accounts){ const changes = diffAssets(prev, cur); if(changes.length && cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId) await sendTelegram(env, buildAssetAuditMsg(changes)); }
+  await kvPut(env,'asset_snapshot', cur);
+  const certs = await checkCertExpiry(env); await kvPut(env,'cert_expiry', certs);
+  if(cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId){ const due = certs.filter(c=>c.days!==null && c.days<=7); if(due.length) await sendTelegram(env, buildCertMsg(due)); }
+  await heartbeat(env);
+}
+async function runProbeMonitoring(env){
+  const cfg = await getTGConfig(env);
+  const cur = await probeEndpoints(env);
+  let prev = []; try { const r = await kvGet(env,'health_probe'); if(r) prev = JSON.parse(r)||[]; } catch(e){}
+  const pmap = Object.fromEntries(prev.map(p=>[p.email+'|'+p.worker, p]));
+  const down = cur.filter(p=>!p.ok && pmap[p.email+'|'+p.worker] && pmap[p.email+'|'+p.worker].ok);
+  if(down.length && cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId) await sendTelegram(env, buildProbeMsg(down));
+  await kvPut(env,'health_probe', cur);
+  const waf = await checkWaf(env); await kvPut(env,'waf_status', waf);
+  if(cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId){ const sp = waf.filter(w=>w.blocked>=50000); if(sp.length) await sendTelegram(env, buildWafMsg(sp)); }
+  await checkQuotaAlerts(env);
+  try { const r = await kvGet(env,'tg_cron_heartbeat'); if(r){ const h = JSON.parse(r); if(!h.warned && Date.now()-h.last > 26*3600*1000){ await sendTelegram(env, '⏰ Cron 心跳异常：日报 cron 已超过 26 小时未运行，可能已被 CF 静默停止，请检查触发器配置。'); await kvPut(env,'tg_cron_heartbeat', Object.assign(h,{warned:true})); } } } catch(e){}
 }
 
 async function getWorkerScriptInternal(email, key, accountId, scriptName) {
@@ -1278,6 +1613,8 @@ input:checked + .slider:before{transform:translateX(16px)}
       <div class="item" data-page="kv" onclick="navTo('kv')">Workers KV</div>
       <div class="item" data-page="d1" onclick="navTo('d1')">D1 数据库</div>
       <div class="item" data-page="dns" onclick="navTo('dns')">域名管理</div>
+      <div class="item" data-page="monitor" onclick="navTo('monitor')">监控中心</div>
+      <div class="item" data-page="bulk" onclick="navTo('bulk')">批量操作</div>
       <div class="item" data-page="settings" onclick="navTo('settings')">设置</div>
     </nav>
     
@@ -1638,6 +1975,84 @@ input:checked + .slider:before{transform:translateX(16px)}
         <button class="btn" onclick="refreshTGUsage()">刷新今日全账号请求</button>
       </div>
       <div id="tgUsageBox" class="small" style="margin-top:12px;white-space:pre-wrap;font-family:monospace"></div>
+    </div>
+
+    <!-- Monitor Page -->
+    <div id="monitor-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">监控中心</div>
+        <div>
+          <button class="btn" onclick="runMonitorNow()">立即巡检</button>
+          <button class="btn primary" onclick="loadMonitor()">刷新</button>
+        </div>
+      </div>
+      <div class="small" style="margin:4px 0 12px">数据由 Cron 自动采集（每日 23:55 UTC 快照 / 每 4h 探活+WAF），也可点「立即巡检」手动触发。异常会通过 TG 告警。</div>
+
+      <div class="grid">
+        <div class="card">
+          <h2 style="margin:0 0 4px">请求用量趋势（近 30 天）</h2>
+          <div class="small" id="trendPrediction">加载中...</div>
+          <div id="trendChart" style="margin-top:10px"></div>
+        </div>
+        <div class="card">
+          <h2 style="margin:0 0 8px">存储限额监控</h2>
+          <div id="storageBox" class="small" style="white-space:pre-wrap;font-family:monospace">加载中...</div>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:16px">
+        <div class="card">
+          <h2 style="margin:0 0 8px">账号存活 / 资产变更审计</h2>
+          <div id="assetBox" class="small" style="white-space:pre-wrap;font-family:monospace">加载中...</div>
+        </div>
+        <div class="card">
+          <h2 style="margin:0 0 8px">外部探活</h2>
+          <div id="probeBox" class="small" style="white-space:pre-wrap;font-family:monospace">加载中...</div>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:16px">
+        <div class="card">
+          <h2 style="margin:0 0 8px">SSL 证书到期</h2>
+          <div id="certBox" class="small" style="white-space:pre-wrap;font-family:monospace">加载中...</div>
+        </div>
+        <div class="card">
+          <h2 style="margin:0 0 8px">WAF 拦截量（24h）</h2>
+          <div id="wafBox" class="small" style="white-space:pre-wrap;font-family:monospace">加载中...</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2 style="margin:0 0 8px">操作审计日志</h2>
+        <div id="auditBox" class="small" style="white-space:pre-wrap;font-family:monospace;max-height:320px;overflow:auto">加载中...</div>
+      </div>
+    </div>
+
+    <!-- Bulk Page -->
+    <div id="bulk-page" class="page-content">
+      <div class="header"><div style="font-size:20px;font-weight:700">批量操作</div></div>
+      <div class="grid">
+        <div class="card">
+          <h2 style="margin:0 0 6px">批量部署 Worker（跨账号）</h2>
+          <div class="small">选择账号，将同一脚本部署到各账号。部署结果会写入审计日志并可在 TG 收到回报。</div>
+          <div id="bulkAccountList" style="margin:10px 0;max-height:180px;overflow:auto;border:1px solid #eef2f6;border-radius:8px;padding:8px"></div>
+          <input id="bulkScriptName" class="input" placeholder="Worker 名称（如 api-gateway）" style="margin-bottom:8px">
+          <textarea id="bulkScriptSource" class="input" placeholder="Worker 脚本源码（留空则用默认响应）" style="min-height:120px;font-family:monospace"></textarea>
+          <div style="margin-top:10px"><button class="btn primary" onclick="deployBulk()">批量部署</button></div>
+          <div id="bulkDeployLog" class="small" style="margin-top:10px;white-space:pre-wrap;font-family:monospace"></div>
+        </div>
+        <div class="card">
+          <h2 style="margin:0 0 6px">批量清缓存 / DNS 代理（当前账号）</h2>
+          <div class="small">勾选域名后，可批量清除缓存或切换 DNS 代理状态（暂停=false 即开启代理）。</div>
+          <div id="bulkZoneList" style="margin:10px 0;max-height:180px;overflow:auto;border:1px solid #eef2f6;border-radius:8px;padding:8px"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn" onclick="bulkPurge()">批量清缓存</button>
+            <button class="btn" onclick="bulkDns(false)">开启代理</button>
+            <button class="btn danger" onclick="bulkDns(true)">暂停代理</button>
+          </div>
+          <div id="bulkDnsLog" class="small" style="margin-top:10px;white-space:pre-wrap;font-family:monospace"></div>
+        </div>
+      </div>
     </div>
 
 <!-- Modals -->
@@ -2100,6 +2515,7 @@ function renderStaticJS(env) {
         case 'kv': refreshKVNamespaces(); break;
         case 'd1': refreshD1Databases(); break;
         case 'dns': showZonesList(); break; case 'snippets': showSnippetsZonesList(); break;
+        case 'monitor': loadMonitor(); break; case 'bulk': renderBulkAccounts(); renderBulkZones(); break;
         case 'settings': loadSubdomainSettings(); break;
       }
     }
@@ -2807,6 +3223,90 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
         (u.byScript||[]).slice(0,5).forEach(s=> txt += '   - ' + s.script + ': ' + (s.requests||0).toLocaleString() + '\n');
       }
       box.textContent = txt;
+    }
+    // ================= 监控中心 =================
+    function renderTrendChart(series){
+      const box = el('trendChart');
+      if(!series || !series.length){ box.innerHTML = '<div class="small">暂无历史数据（需 Cron 运行至少一天）</div>'; return; }
+      const max = Math.max(1, ...series.map(s=>s.total));
+      const w = 600, h = 160, pad = 28;
+      const stepX = (w-pad*2)/Math.max(1, series.length-1);
+      const pts = series.map((s,i)=>{ const x = pad + i*stepX; const y = h-pad - (s.total/max)*(h-pad*2); return x.toFixed(1)+','+y.toFixed(1); });
+      const bars = series.map((s,i)=>{ const x = pad + i*stepX; const bh = (s.total/max)*(h-pad*2); return '<rect x="'+(x-3)+'" y="'+(h-pad-bh)+'" width="6" height="'+bh.toFixed(1)+'" fill="#0070f3" rx="2"></rect>'; }).join('');
+      const labels = series.filter((_,i)=>i%Math.ceil(series.length/6)===0).map((s,i)=>{ const x = pad + i*stepX*Math.ceil(series.length/6); return '<text x="'+Math.min(w-pad,x).toFixed(1)+'" y="'+(h-8)+'" font-size="9" fill="#94a3b8">'+s.date.slice(5)+'</text>'; }).join('');
+      box.innerHTML = '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="max-width:600px">'+bars+'<polyline points="'+pts.join(' ')+'" fill="none" stroke="#00d4ff" stroke-width="2"/>'+labels+'</svg>';
+    }
+    async function loadMonitor(){
+      try {
+        const t = await api('get-usage-trend', {});
+        if(t && t.success){
+          renderTrendChart(t.trend);
+          const p = t.prediction;
+          el('trendPrediction').textContent = p ? ('预测: ' + p.trend + (p.daysToLimit!=null ? ('，日均增长 '+p.dailyGrowth + '，约 ' + p.daysToLimit + ' 天后接近上限 (' + p.eta + ')') : '，暂无需担心')) : '数据不足，无法预测';
+        }
+        const s = await api('get-storage-usage', {});
+        if(s && s.success){ el('storageBox').textContent = (s.data||[]).map(d=> d.error ? ('['+maskEmailFront(d.email)+'] 查询失败') : ('['+maskEmailFront(d.email)+(d.name?' '+d.name:'')+'] D1库:'+d.d1Count+' R2操作:'+(d.r2Ops||0).toLocaleString()+' KV操作:'+(d.kvOps||0).toLocaleString())).join('\n') || '无数据'; }
+        const a = await api('get-asset-audit', {});
+        if(a && a.success){ const snap = a.snapshot; if(!snap){ el('assetBox').textContent='暂无快照'; } else { const lines=[]; for(const e of Object.keys(snap.accounts||{})){ const c = snap.accounts[e]; if(!c.alive){ lines.push('✗ '+maskEmailFront(e)+' 失效: '+(c.error||'')); continue; } const accs = c.accounts||[]; const wsum = accs.reduce((t,x)=>t+(x.workers||[]).length,0); const zsum = accs.reduce((t,x)=>t+(x.zones||[]).length,0); lines.push('✓ '+maskEmailFront(e)+' 账号'+accs.length+' Workers'+wsum+' Zones'+zsum); } el('assetBox').textContent = lines.join('\n'); } }
+        const pr = await api('get-health-probe', {});
+        if(pr && pr.success){ el('probeBox').textContent = (pr.results||[]).map(r=> (r.ok?'✓':'✗')+' '+r.worker+' ['+r.account+'] '+(r.status<0?'超时':r.status)+' '+(r.ms||0)+'ms').join('\n') || '无数据'; }
+        const ce = await api('get-cert-expiry', {});
+        if(ce && ce.success){ el('certBox').textContent = (ce.certs||[]).map(c=> '['+maskEmailFront(c.email)+'] '+c.zone+': '+(c.days!=null?c.days+' 天':'无证书')).join('\n') || '无数据'; }
+        const wf = await api('get-waf-status', {});
+        if(wf && wf.success){ el('wafBox').textContent = (wf.waf||[]).map(w=> '['+maskEmailFront(w.email)+'] '+w.zone+': 拦截 '+(w.blocked||0).toLocaleString()).join('\n') || '无数据'; }
+        const al = await api('get-audit-log', {});
+        if(al && al.success){ el('auditBox').textContent = (al.log||[]).map(l=> l.ts+'  '+(l.action||'')+(l.count?(' x'+l.count):'')).join('\n') || '暂无审计日志'; }
+      } catch(e){ showNotification('监控加载失败: '+e.message, 'error'); }
+    }
+    async function runMonitorNow(){
+      const btn = event && event.target; if(btn) btn.disabled = true;
+      try { const r = await api('run-monitor-now', {}); if(r && r.success){ showNotification('巡检完成'); setTimeout(loadMonitor, 800); } else showNotification((r&&r.error)||'失败','error'); }
+      catch(e){ showNotification('失败: '+e.message,'error'); }
+      finally { if(btn) btn.disabled = false; }
+    }
+    // ================= 批量操作 =================
+    function renderBulkAccounts(){
+      const arr = loadSaved(); const list = el('bulkAccountList'); list.innerHTML = '';
+      if(!arr.length){ list.innerHTML = '<div class="small">请先在登录页添加账号</div>'; return; }
+      arr.forEach((acc, idx) => { const d = document.createElement('div'); d.style.cssText='padding:6px 0'; d.innerHTML = '<label style="cursor:pointer;display:flex;align-items:center"><input type="checkbox" class="bulk-acc-chk" value="'+idx+'" style="margin-right:8px"><span style="font-size:13px">'+escapeHtml(acc.email)+'</span></label>'; list.appendChild(d); });
+    }
+    async function renderBulkZones(){
+      const c = getActiveCreds(); const list = el('bulkZoneList'); list.innerHTML = '加载中...';
+      if(!c.email){ list.innerHTML = '<div class="small">请先登录一个账号</div>'; return; }
+      const r = await api('list-zones', {});
+      if(!r || !r.success){ list.innerHTML = '<div class="small">获取域名失败</div>'; return; }
+      list.innerHTML = '';
+      (r.result||[]).forEach(z => { const d = document.createElement('div'); d.style.cssText='padding:6px 0'; d.innerHTML = '<label style="cursor:pointer;display:flex;align-items:center"><input type="checkbox" class="bulk-zone-chk" value="'+z.id+'" style="margin-right:8px"><span style="font-size:13px">'+escapeHtml(z.name)+'</span></label>'; list.appendChild(d); });
+    }
+    async function deployBulk(){
+      const log = el('bulkDeployLog'); log.textContent = '准备中...';
+      const name = el('bulkScriptName').value.trim(); if(!name){ showNotification('请填写 Worker 名称','error'); return; }
+      const src = el('bulkScriptSource').value;
+      const arr = loadSaved(); const targets = []; const checked = Array.from(document.querySelectorAll('.bulk-acc-chk:checked'));
+      if(!checked.length){ showNotification('请选择至少一个账号','error'); return; }
+      for(const ch of checked){ const acc = arr[+ch.value]; if(!acc) continue; const r = await api('list-accounts', { email:acc.email, key:acc.key }); if(r && r.success){ for(const a of (r.result||[])) targets.push({ email:acc.email, key:acc.key, accountId:a.id }); } }
+      if(!targets.length){ log.textContent = '未解析到目标账号'; return; }
+      log.textContent = '部署到 ' + targets.length + ' 个账号...';
+      const r = await api('bulk-deploy', { scriptName:name, scriptSource:src, targets });
+      if(!r || !r.success){ log.textContent = (r&&r.error)||'失败'; return; }
+      log.textContent = r.results.map(x=> (x.ok?'✓':'✗')+' '+x.accountId+': '+(x.message||'')).join('\n');
+      showNotification('批量部署完成');
+    }
+    async function bulkPurge(){
+      const log = el('bulkDnsLog'); const c = getActiveCreds();
+      const zoneIds = Array.from(document.querySelectorAll('.bulk-zone-chk:checked')).map(x=>x.value);
+      if(!zoneIds.length){ showNotification('请勾选域名','error'); return; }
+      log.textContent = '清缓存中...';
+      const r = await api('bulk-purge', { zoneIds, email:c.email, key:c.key, everything:true });
+      log.textContent = r && r.success ? r.results.map(x=>(x.ok?'✓':'✗')+' '+x.zoneId+(x.message?(': '+x.message):'')).join('\n') : ((r&&r.error)||'失败');
+    }
+    async function bulkDns(paused){
+      const log = el('bulkDnsLog'); const c = getActiveCreds();
+      const zoneIds = Array.from(document.querySelectorAll('.bulk-zone-chk:checked')).map(x=>x.value);
+      if(!zoneIds.length){ showNotification('请勾选域名','error'); return; }
+      log.textContent = (paused?'暂停':'开启')+'代理中...';
+      const r = await api('bulk-dns', { zoneIds, email:c.email, key:c.key, paused });
+      log.textContent = r && r.success ? r.results.map(x=>(x.ok?'✓':'✗')+' '+x.zoneId).join('\n') : ((r&&r.error)||'失败');
     }
     (async function loadTGOnSettings(){
       try { const r = await api('load-tg-config', {}); if(r && r.success && r.config){
