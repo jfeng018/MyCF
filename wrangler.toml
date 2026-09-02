@@ -1,0 +1,24 @@
+name = "mycf"
+main = "_worker.js"
+compatibility_date = "2024-09-23"
+
+# KV 命名空间：存储账号信息(accounts) 与 TG 配置(tg_config)、告警状态(tg_quota_alert)
+# 先在 Cloudflare 控制台创建 KV 命名空间，把它的 ID 填到下面
+kv_namespaces = [
+  { binding = "CF_ACCOUNTS_KV", id = "在此填写你的_KV_namespace_id" }
+]
+
+# 可选：直接写死 TG 凭据（也可在面板「设置」里配置，二选一）
+# 不填则使用面板保存的 tg_config
+# [vars]
+# TG_BOT_TOKEN = ""
+# TG_CHAT_ID = ""
+
+# 定时触发器（免费版每账号最多 5 个）
+# 1) 每日 UTC 23:55 推送当日请求日报（北京时间 07:55，配额 UTC 00:00 重置前，数据最完整）
+# 2) 每 4 小时检查配额阈值告警（50% / 80% / 95% 三档，当天同档只推一次）
+[triggers]
+crons = [
+  "55 23 * * *",
+  "0 */4 * * *"
+]

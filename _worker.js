@@ -13,6 +13,20 @@
 export default {
   async fetch(request, env, ctx) {
     return await handleRequest(request, env);
+  },
+  async scheduled(event, env, ctx) {
+    try {
+      const cron = event.cron || '';
+      // 每日 UTC 23:55 推当日请求日报（北京时间 07:55，配额 UTC 重置前）
+      if (cron === '55 23 * * *') {
+        await pushDailyReport(env);
+      } else {
+        // 其余触发（每 4 小时）= 配额阈值告警检查
+        await checkQuotaAlerts(env);
+      }
+    } catch (e) {
+      console.error('scheduled error', e);
+    }
   }
 };
 
@@ -698,12 +712,224 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         return json({ success: true, accounts });
       }
 
+      case 'save-tg-config': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
+        const cfg = payload.config || {};
+        const cur = await env.CF_ACCOUNTS_KV.get('tg_config');
+        let merged = { enabled:true, dailyReport:true, alerts:true };
+        if (cur) { try { merged = Object.assign(merged, JSON.parse(cur)); } catch(e){} }
+        if (typeof cfg.botToken === 'string') merged.botToken = cfg.botToken;
+        if (typeof cfg.chatId === 'string') merged.chatId = cfg.chatId;
+        if (typeof cfg.enabled === 'boolean') merged.enabled = cfg.enabled;
+        if (typeof cfg.dailyReport === 'boolean') merged.dailyReport = cfg.dailyReport;
+        if (typeof cfg.alerts === 'boolean') merged.alerts = cfg.alerts;
+        await env.CF_ACCOUNTS_KV.put('tg_config', JSON.stringify(merged));
+        return json({ success: true });
+      }
+
+      case 'load-tg-config': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success:false, error:'CF_ACCOUNTS_KV 未绑定' });
+        const raw = await env.CF_ACCOUNTS_KV.get('tg_config');
+        const cfg = raw ? JSON.parse(raw) : { enabled:true, dailyReport:true, alerts:true };
+        const masked = cfg.botToken ? (cfg.botToken.slice(0,4) + '****' + cfg.botToken.slice(-4)) : '';
+        return json({ success:true, config: Object.assign({}, cfg, { botToken: masked, botTokenSet: !!cfg.botToken }) });
+      }
+
+      case 'push-tg-test': {
+        const r = await sendTelegram(env, '✅ MyCF TG 推送测试成功\n时间: ' + new Date().toISOString());
+        return json(r.ok ? { success:true } : { success:false, error:r.error });
+      }
+
+      case 'push-tg-now': {
+        const r = await pushDailyReport(env);
+        return json(r.ok ? { success:true } : { success:false, error:r.error });
+      }
+
+      case 'get-all-usage': {
+        const creds = await loadKVAccounts(env);
+        if (!creds.length) return json({ success:false, error:'KV 中无账号' });
+        const results = [];
+        for (const c of creds) {
+          try { const list = await queryAllUsageForCred(env, c); results.push(...list); }
+          catch(e){ results.push({ email:c.email, error:String(e) }); }
+        }
+        return json({ success:true, date: new Date().toISOString().slice(0,10), results });
+      }
+
       default:
         return json({ success:false, error:'unknown action' },400);
     }
   } catch(e) {
     return json({ success:false, error: String(e) },500);
   }
+}
+
+// ---------------- Telegram 推送 ----------------
+function fmtNum(n){ return (n||0).toLocaleString('en-US'); }
+function maskEmail(e){
+  if(!e) return '未知';
+  const i = String(e).indexOf('@');
+  if(i <= 0) return '未知';
+  const u = e.slice(0,i), d = e.slice(i+1);
+  if(u.length <= 1) return '*@' + d;
+  return u.slice(0,1) + '***@' + d;
+}
+function quotaBar(pct){
+  const n = Math.max(0, Math.min(10, Math.round((pct||0)/10)));
+  return '█'.repeat(n) + '░'.repeat(10-n);
+}
+function computeExhaustion(total){
+  if(!total || total <= 0) return null;
+  const now = new Date();
+  const sod = new Date(now); sod.setUTCHours(0,0,0,0);
+  const elapsed = (now - sod)/1000;
+  if(elapsed <= 0) return null;
+  const rate = total/elapsed;
+  const remain = 100000 - total;
+  if(remain <= 0) return '已耗尽';
+  const eta = new Date(now.getTime() + (remain/rate)*1000);
+  return eta.toISOString().slice(11,16) + ' UTC';
+}
+async function loadKVAccounts(env){
+  if(!env || !env.CF_ACCOUNTS_KV) return [];
+  const raw = await env.CF_ACCOUNTS_KV.get('accounts');
+  if(!raw) return [];
+  try { const a = JSON.parse(raw); return Array.isArray(a) ? a : []; } catch(e){ return []; }
+}
+async function getTGConfig(env){
+  let botToken = env && env.TG_BOT_TOKEN;
+  let chatId = env && env.TG_CHAT_ID;
+  const cfg = { enabled:true, dailyReport:true, alerts:true };
+  if(env && env.CF_ACCOUNTS_KV){
+    const raw = await env.CF_ACCOUNTS_KV.get('tg_config');
+    if(raw){ try { Object.assign(cfg, JSON.parse(raw)); } catch(e){} }
+  }
+  if(!botToken && cfg.botToken) botToken = cfg.botToken;
+  if(!chatId && cfg.chatId) chatId = cfg.chatId;
+  return { botToken, chatId, enabled: cfg.enabled !== false, dailyReport: cfg.dailyReport !== false, alerts: cfg.alerts !== false };
+}
+async function sendTelegram(env, text){
+  const cfg = await getTGConfig(env);
+  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置：请在「设置」填写 Bot Token 与 Chat ID' };
+  const chunks = splitTGMessage(text);
+  for(const c of chunks){
+    const r = await fetch('https://api.telegram.org/bot' + cfg.botToken + '/sendMessage', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ chat_id: cfg.chatId, text:c, disable_web_page_preview:true })
+    });
+    if(!r.ok){ const t = await r.text(); return { ok:false, error:'TG 发送失败: ' + r.status + ' ' + t.slice(0,200) }; }
+  }
+  return { ok:true };
+}
+function splitTGMessage(text){
+  const MAX = 3900; const lines = String(text).split('\n'); const out=[]; let cur='';
+  for(const ln of lines){
+    if((cur + '\n' + ln).length > MAX){ if(cur) out.push(cur); cur = ln; }
+    else cur = cur ? cur + '\n' + ln : ln;
+  }
+  if(cur) out.push(cur);
+  return out.length ? out : [''];
+}
+const TG_USAGE_QUERY = `query Usage($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){dimensions{scriptName}sum{requests}}}}}`;
+async function queryUsageByAccountId(email, key, accountId){
+  const now = new Date();
+  const end = now.toISOString();
+  now.setUTCHours(0,0,0,0);
+  const start = now.toISOString();
+  const r = await fetch('https://api.cloudflare.com/client/v4/graphql', {
+    method:'POST', headers:{'Content-Type':'application/json','X-Auth-Email':email,'X-Auth-Key':key},
+    body: JSON.stringify({ query: TG_USAGE_QUERY, variables:{ accountId, filter:{ datetime_geq:start, datetime_leq:end } } })
+  });
+  if(!r.ok) return { total:0, workers:0, pages:0, percent:0, byScript:[], error:true };
+  const res = await r.json();
+  const ac = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
+  const pages = (ac && ac.pagesFunctionsInvocationsAdaptiveGroups || []).reduce((t,i)=>t+((i&&i.sum&&i.sum.requests)||0),0);
+  const groups = (ac && ac.workersInvocationsAdaptive) || [];
+  const workers = groups.reduce((t,i)=>t+((i&&i.sum&&i.sum.requests)||0),0);
+  const byScript = groups.filter(g=>g&&g.dimensions&&g.dimensions.scriptName).map(g=>({ script:g.dimensions.scriptName, requests:(g.sum&&g.sum.requests)||0 })).sort((a,b)=>b.requests-a.requests);
+  return { total: pages+workers, workers, pages, percent: Math.min(100, ((pages+workers)/100000)*100), byScript, error:false };
+}
+async function queryAllUsageForCred(env, cred){
+  const ar = await cfGet('/accounts', cred.email, cred.key);
+  if(!ar || !ar.success || !Array.isArray(ar.result)) return [{ email:cred.email, error:'无法获取账号列表' }];
+  const out = [];
+  for(const a of ar.result){
+    const u = await queryUsageByAccountId(cred.email, cred.key, a.id);
+    out.push({ email:cred.email, accountId:a.id, name:a.name, ...u });
+  }
+  return out;
+}
+function buildDailyReport(results, dateStr){
+  const totalReq = results.reduce((t,r)=>t+(r.total||0),0);
+  const L = [];
+  L.push('📊 MyCF 每日请求报告');
+  L.push('日期(UTC): ' + dateStr);
+  L.push('账号数: ' + results.length + '  当日总请求: ' + fmtNum(totalReq));
+  L.push('────────────────────');
+  for(const r of results){
+    const masked = maskEmail(r.email);
+    const name = r.name ? ' (' + r.name + ')' : '';
+    if(r.error){ L.push(''); L.push('▌' + masked + name); L.push('  查询失败: ' + r.error); continue; }
+    L.push('');
+    L.push('▌' + masked + name);
+    L.push(' ' + fmtNum(r.total) + ' / 100,000 (' + r.percent.toFixed(1) + '%)');
+    L.push(' ' + quotaBar(r.percent));
+    L.push(' Workers: ' + fmtNum(r.workers) + '  Pages: ' + fmtNum(r.pages));
+    if(r.byScript && r.byScript.length){
+      L.push(' Top Workers:');
+      r.byScript.slice(0,5).forEach(s=> L.push('  • ' + s.script + ': ' + fmtNum(s.requests)));
+    }
+  }
+  L.push('');
+  L.push('────────────────────');
+  L.push('由 MyCF 自动推送 · 配额按 UTC 重置');
+  return L.join('\n');
+}
+function buildQuotaAlert(u, tier){
+  const masked = maskEmail(u.email);
+  const eta = computeExhaustion(u.total);
+  const etaStr = eta ? ('\n预计打满(UTC): ' + eta) : '';
+  return '⚠️ 配额告警 [' + tier + '%]\n' + masked + ' 已用 ' + fmtNum(u.total) + ' / 100,000 (' + u.percent.toFixed(1) + '%)' + etaStr;
+}
+async function pushDailyReport(env){
+  const cfg = await getTGConfig(env);
+  if(!cfg.enabled || !cfg.dailyReport) return { ok:false, error:'日报未启用' };
+  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置' };
+  const creds = await loadKVAccounts(env);
+  if(!creds.length) return { ok:false, error:'KV 中无账号' };
+  const results = [];
+  for(const c of creds){
+    try { const list = await queryAllUsageForCred(env, c); results.push(...list); }
+    catch(e){ results.push({ email:c.email, error:String(e) }); }
+  }
+  const dateStr = new Date().toISOString().slice(0,10);
+  const msg = buildDailyReport(results, dateStr);
+  return await sendTelegram(env, msg);
+}
+async function checkQuotaAlerts(env){
+  const cfg = await getTGConfig(env);
+  if(!cfg.enabled || !cfg.alerts) return;
+  if(!cfg.botToken || !cfg.chatId) return;
+  const creds = await loadKVAccounts(env);
+  let state = {};
+  if(env && env.CF_ACCOUNTS_KV){ const raw = await env.CF_ACCOUNTS_KV.get('tg_quota_alert'); if(raw){ try{ state = JSON.parse(raw); }catch(e){} } }
+  const today = new Date().toISOString().slice(0,10);
+  const tiers = [50,80,95];
+  const toSend = [];
+  for(const c of creds){
+    let list = []; try{ list = await queryAllUsageForCred(env, c); }catch(e){}
+    for(const u of list){
+      const pct = u.percent || 0;
+      let tier = 0; for(const t of tiers){ if(pct >= t) tier = t; }
+      const prev = state[c.email];
+      if(tier > 0 && (!prev || prev.date !== today || (prev.tier||0) < tier)){
+        toSend.push(buildQuotaAlert(u, tier));
+        state[c.email] = { date: today, tier };
+      }
+    }
+  }
+  if(toSend.length) await sendTelegram(env, toSend.join('\n\n'));
+  if(env && env.CF_ACCOUNTS_KV) await env.CF_ACCOUNTS_KV.put('tg_quota_alert', JSON.stringify(state));
 }
 
 async function getWorkerScriptInternal(email, key, accountId, scriptName) {
@@ -1391,6 +1617,28 @@ input:checked + .slider:before{transform:translateX(16px)}
       </div>
     </div>
 
+
+    <!-- TG 推送设置 -->
+    <div class="card" style="margin-top:16px">
+      <h3 style="margin:0">Telegram 推送设置</h3>
+      <div class="small" style="margin-top:8px">配置 Bot Token 与 Chat ID 后，可定时推送每日请求报告与配额告警到你的 TG 机器人（10 个账号已支持，凭据从 KV 读取）。</div>
+      <div style="margin-top:12px;display:grid;gap:8px">
+        <input id="tgBotToken" class="input" placeholder="Bot Token（格式：123456:ABCdef...）">
+        <input id="tgChatId" class="input" placeholder="Chat ID（你的 TG 账号或群 ID）">
+      </div>
+      <div style="margin-top:10px;display:flex;gap:16px;flex-wrap:wrap">
+        <label><input type="checkbox" id="tgEnabled" checked> 启用推送</label>
+        <label><input type="checkbox" id="tgDaily" checked> 每日日报</label>
+        <label><input type="checkbox" id="tgAlerts" checked> 配额告警(50/80/95%)</label>
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn primary" onclick="saveTGConfig()">保存配置</button>
+        <button class="btn" onclick="testTG()">测试推送</button>
+        <button class="btn" onclick="pushTGNow()">立即推送日报</button>
+        <button class="btn" onclick="refreshTGUsage()">刷新今日全账号请求</button>
+      </div>
+      <div id="tgUsageBox" class="small" style="margin-top:12px;white-space:pre-wrap;font-family:monospace"></div>
+    </div>
 
 <!-- Modals -->
 <div id="accountModal" class="modal"><div class="modal-box small">
@@ -2526,6 +2774,49 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     async function confirmAddZone() { const name = el('zoneName').value.trim(); if (!name) return showNotification('请输入域名', 'error'); const res = await api('create-zone', { name }); if (res && res.result) { showNotification('域名添加成功，请在域名注册商处修改 NS 记录'); el('addZoneModal').style.display = 'none'; refreshZones(); if (typeof refreshSnippetZones === 'function') refreshSnippetZones(); } else { showNotification(res.error || '添加失败', 'error'); } }
     async function loadSubdomainSettings() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('get-workers-subdomain', { accountId }); if (res && res.result) { const subdomain = res.result.subdomain; el('subdomainInput').value = subdomain || ''; } }
     async function saveSubdomain() { const subdomain = el('subdomainInput').value.trim(); if (!subdomain) return showNotification('请输入子域名', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('put-workers-subdomain', { accountId, subdomain }); if (res && res.success) { showNotification(res.message || 'Workers 域名设置成功'); setTimeout(refreshWorkers, 1000); } else { showNotification(res.error || '设置保存失败', 'error'); } }
+
+    function maskEmailFront(e){ const i = String(e||'').indexOf('@'); if(i <= 0) return e||''; const u = e.slice(0,i), d = e.slice(i+1); return (u.length <= 1 ? '*' : u.slice(0,1) + '***') + '@' + d; }
+    async function saveTGConfig(){
+      const config = {
+        botToken: el('tgBotToken').value.trim(),
+        chatId: el('tgChatId').value.trim(),
+        enabled: el('tgEnabled').checked,
+        dailyReport: el('tgDaily').checked,
+        alerts: el('tgAlerts').checked
+      };
+      const r = await api('save-tg-config', { config });
+      if(r && r.success) showNotification('TG 配置已保存'); else showNotification((r&&r.error)||'保存失败','error');
+    }
+    async function testTG(){
+      const r = await api('push-tg-test', {});
+      if(r && r.success) showNotification('测试消息已发送，请查看 TG'); else showNotification((r&&r.error)||'发送失败','error');
+    }
+    async function pushTGNow(){
+      const r = await api('push-tg-now', {});
+      if(r && r.success) showNotification('日报已推送'); else showNotification((r&&r.error)||'推送失败','error');
+    }
+    async function refreshTGUsage(){
+      const box = el('tgUsageBox'); box.textContent = '加载中...';
+      const r = await api('get-all-usage', {});
+      if(!r || !r.success){ box.textContent = (r&&r.error)||'获取失败'; return; }
+      let txt = '日期(UTC): ' + r.date + '\n';
+      for(const u of r.results){
+        const m = maskEmailFront(u.email);
+        if(u.error){ txt += '\n[' + m + '] 失败: ' + u.error; continue; }
+        txt += '\n[' + m + (u.name ? ' ' + u.name : '') + '] ' + (u.total||0).toLocaleString() + ' / 100,000 (' + (u.percent||0).toFixed(1) + '%)  W:' + (u.workers||0) + ' P:' + (u.pages||0) + '\n';
+        (u.byScript||[]).slice(0,5).forEach(s=> txt += '   - ' + s.script + ': ' + (s.requests||0).toLocaleString() + '\n');
+      }
+      box.textContent = txt;
+    }
+    (async function loadTGOnSettings(){
+      try { const r = await api('load-tg-config', {}); if(r && r.success && r.config){
+        if(r.config.botTokenSet) el('tgBotToken').placeholder = '已保存 (' + r.config.botToken + ')';
+        if(r.config.chatId) el('tgChatId').value = r.config.chatId;
+        el('tgEnabled').checked = r.config.enabled !== false;
+        el('tgDaily').checked = r.config.dailyReport !== false;
+        el('tgAlerts').checked = r.config.alerts !== false;
+      }} catch(e){}
+    })();
     
     let currentBindType = 'kv';
     async function refreshBindList(){ const type = el('bindType').value; currentBindType = type; const accountId = localStorage.getItem('cf_accountId') || (await api('list-accounts')).result?.[0]?.id; if (!accountId) { el('bindSelect').innerHTML='<option>无 account</option>'; return; } el('bindSelect').innerHTML = '<option value="">加载中...</option>'; try { if (type==='kv') { const kv = await api('list-kv-namespaces', { accountId }); const arr = kv.result || []; el('bindSelect').innerHTML=''; if(arr.length) { arr.forEach(ns=>{ const opt=document.createElement('option'); opt.value=ns.id; opt.textContent=(ns.title||ns.name||ns.id) + ' (' + ns.id + ')'; el('bindSelect').appendChild(opt); }); } else { el('bindSelect').innerHTML='<option value="">未找到 KV 命名空间</option>'; } } else { const d1 = await api('list-d1', { accountId }); const arr = d1.result || []; el('bindSelect').innerHTML=''; if(arr.length) { arr.forEach(db=>{ const id=db.uuid||db.id; const opt=document.createElement('option'); opt.value=id; opt.textContent=(db.name||db.uuid||db.id) + ' (' + id + ')'; el('bindSelect').appendChild(opt); }); } else { el('bindSelect').innerHTML='<option value="">未找到 D1 数据库</option>'; } } } catch (error) { console.error('刷新绑定列表失败:', error); el('bindSelect').innerHTML='<option value="">加载失败</option>'; } }
