@@ -77,6 +77,11 @@ async function handleRequest(request, env) {
     }
   }
 
+  // Telegram 机器人 webhook（无需 session，依靠 webhook URL 保密 + token 校验）
+  if (p === '/telegram' && request.method === 'POST') {
+    return handleTelegramWebhook(request, env);
+  }
+
   // session 校验（仅在设置了 ACCESS_PASSWORD 时生效）
   if (hasPassword) {
     const token = getSessionToken(request);
@@ -746,6 +751,25 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         return json(r.ok ? { success:true } : { success:false, error:r.error });
       }
 
+      case 'set-tg-webhook': {
+        let origin = '';
+        try { const u = new URL(req.url); origin = u.origin; } catch(e){}
+        const wh = (payload.webhookUrl && String(payload.webhookUrl).trim()) || (origin ? origin.replace(/\/$/,'') + '/telegram' : '');
+        if(!wh) return json({ success:false, error:'无法确定 webhook URL' });
+        const r = await setTGWebhook(env, wh);
+        return json(r.ok ? { success:true, webhook: wh } : { success:false, error: r.error || JSON.stringify(r.raw||{}) });
+      }
+
+      case 'get-tg-webhook': {
+        const r = await getTGWebhook(env);
+        return json(r.ok ? { success:true, info: r.raw } : { success:false, error: r.error });
+      }
+
+      case 'set-tg-commands': {
+        const r = await registerTGCommands(env);
+        return json(r.ok ? { success:true } : { success:false, error: r.error || JSON.stringify(r.raw||{}) });
+      }
+
       case 'get-all-usage': {
         const creds = await loadKVAccounts(env);
         if (!creds.length) return json({ success:false, error:'KV 中无账号' });
@@ -884,18 +908,24 @@ async function getTGConfig(env){
   if(!chatId && cfg.chatId) chatId = cfg.chatId;
   return { botToken, chatId, enabled: cfg.enabled !== false, dailyReport: cfg.dailyReport !== false, alerts: cfg.alerts !== false };
 }
-async function sendTelegram(env, text){
+async function sendTelegramTo(env, chatId, text){
   const cfg = await getTGConfig(env);
-  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置：请在「设置」填写 Bot Token 与 Chat ID' };
+  if(!cfg.botToken) return { ok:false, error:'TG 未配置：请在「设置」填写 Bot Token 与 Chat ID' };
+  if(!chatId) return { ok:false, error:'TG 未配置 Chat ID' };
   const chunks = splitTGMessage(text);
   for(const c of chunks){
     const r = await fetch('https://api.telegram.org/bot' + cfg.botToken + '/sendMessage', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ chat_id: cfg.chatId, text:c, disable_web_page_preview:true })
+      body: JSON.stringify({ chat_id: chatId, text:c, disable_web_page_preview:true })
     });
     if(!r.ok){ const t = await r.text(); return { ok:false, error:'TG 发送失败: ' + r.status + ' ' + t.slice(0,200) }; }
   }
   return { ok:true };
+}
+async function sendTelegram(env, text){
+  const cfg = await getTGConfig(env);
+  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置：请在「设置」填写 Bot Token 与 Chat ID' };
+  return sendTelegramTo(env, cfg.chatId, text);
 }
 function splitTGMessage(text){
   const MAX = 3900; const lines = String(text).split('\n'); const out=[]; let cur='';
@@ -905,6 +935,72 @@ function splitTGMessage(text){
   }
   if(cur) out.push(cur);
   return out.length ? out : [''];
+}
+// ---- Telegram 机器人指令 ----
+const TG_COMMANDS = [
+  { command:'report', description:'立即推送每日用量报告' },
+  { command:'probe', description:'立即执行端点探活并推送状态' },
+  { command:'help', description:'显示可用指令' }
+];
+async function registerTGCommands(env){
+  const cfg = await getTGConfig(env);
+  if(!cfg.botToken) return { ok:false, error:'TG 未配置' };
+  const r = await fetch('https://api.telegram.org/bot' + cfg.botToken + '/setMyCommands', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ commands: TG_COMMANDS })
+  });
+  const j = await r.json().catch(()=>({}));
+  return { ok: !!j.ok, raw: j };
+}
+async function setTGWebhook(env, webhookUrl){
+  const cfg = await getTGConfig(env);
+  if(!cfg.botToken) return { ok:false, error:'TG 未配置' };
+  const r = await fetch('https://api.telegram.org/bot' + cfg.botToken + '/setWebhook', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ url: webhookUrl })
+  });
+  const j = await r.json().catch(()=>({}));
+  return { ok: !!j.ok, raw: j };
+}
+async function getTGWebhook(env){
+  const cfg = await getTGConfig(env);
+  if(!cfg.botToken) return { ok:false, error:'TG 未配置' };
+  const r = await fetch('https://api.telegram.org/bot' + cfg.botToken + '/getWebhookInfo', { method:'GET' });
+  const j = await r.json().catch(()=>({}));
+  return { ok: !!j.ok, raw: j };
+}
+function tgHelpText(){
+  return '🤖 MyCF 机器人指令：\n/report - 立即推送每日用量报告\n/probe - 立即执行端点探活并推送状态\n/help - 显示本帮助';
+}
+async function handleTelegramWebhook(request, env){
+  let update;
+  try { update = await request.json(); } catch(e){ return new Response('bad json', { status: 400 }); }
+  const cfg = await getTGConfig(env);
+  const msg = update.message; const cb = update.callback_query;
+  let chatId = null, text = null;
+  if(msg){ chatId = msg.chat && msg.chat.id; text = msg.text || ''; }
+  else if(cb){ chatId = cb.message && cb.message.chat && cb.message.chat.id; text = cb.data || ''; }
+  if(!chatId) return new Response('ok', { status: 200 });
+  // 仅响应已配置 Chat ID 的会话，避免陌生人触发
+  if(cfg.chatId && String(cfg.chatId) !== String(chatId)) return new Response('ok', { status: 200 });
+  const t = (text||'').trim();
+  try {
+    if(t === '/start' || t === '/help' || t === 'help' || t === '菜单'){
+      await sendTelegramTo(env, chatId, tgHelpText());
+    } else if(t === '/report' || t === 'report'){
+      const r = await pushDailyReport(env);
+      if(!r.ok) await sendTelegramTo(env, chatId, '❌ 日报推送失败：' + (r.error||''));
+    } else if(t === '/probe' || t === 'probe'){
+      await sendTelegramTo(env, chatId, '⏳ 正在执行端点探活...');
+      await runProbeMonitoring(env);
+      await sendTelegramTo(env, chatId, '✅ 探活完成（异常会单独告警）');
+    } else if(t){
+      await sendTelegramTo(env, chatId, '未知指令，发送 /help 查看可用指令');
+    }
+  } catch(e){
+    try { await sendTelegramTo(env, chatId, '⚠️ 处理指令出错：' + String(e).slice(0,200)); } catch(_){}
+  }
+  return new Response('ok', { status: 200 });
 }
 const TG_USAGE_QUERY = `query Usage($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){dimensions{scriptName}sum{requests}}}}}`;
 async function queryUsageByAccountId(email, key, accountId){
@@ -2032,6 +2128,12 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <button class="btn" onclick="testTG()">测试推送</button>
         <button class="btn" onclick="pushTGNow()">立即推送日报</button>
         <button class="btn" onclick="refreshTGUsage()">刷新今日全账号请求</button>
+      </div>
+      <div class="small" style="margin-top:12px">机器人菜单（在 TG 里发 /report 可手动触发日报）：需先把 Webhook 指向本 Worker，并注册指令菜单。</div>
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" onclick="setupTGWebhook()">设置机器人 Webhook</button>
+        <button class="btn" onclick="setupTGCommands()">注册菜单指令</button>
+        <button class="btn" onclick="showTGWebhook()">查看 Webhook</button>
       </div>
       <div id="tgUsageBox" class="small" style="margin-top:12px;white-space:pre-wrap;font-family:monospace"></div>
     </div>
@@ -3368,6 +3470,21 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       }
       box.textContent = txt;
     }
+    async function setupTGWebhook(){
+      const r = await api('set-tg-webhook', {});
+      if(r && r.success){ showNotification('Webhook 已设置: ' + (r.webhook||'')); }
+      else showNotification((r&&r.error)||'Webhook 设置失败', 'error');
+    }
+    async function setupTGCommands(){
+      const r = await api('set-tg-commands', {});
+      if(r && r.success){ showNotification('菜单指令已注册（/report /probe /help）'); }
+      else showNotification((r&&r.error)||'注册失败', 'error');
+    }
+    async function showTGWebhook(){
+      const r = await api('get-tg-webhook', {});
+      if(r && r.success){ const info = r.info||{}; showNotification('Webhook: ' + (info.url||'未设置') + '  待处理更新: ' + (info.pending_update_count||0)); }
+      else showNotification((r&&r.error)||'获取失败', 'error');
+    }
     // ================= 监控中心 =================
     function renderTrendChart(series){
       const box = el('trendChart');
@@ -3486,6 +3603,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     window.filterRows = filterRows; window.sortTable = sortTable; window.restoreFromKV = restoreFromKV;
     window.toggleDark = toggleDark; window.toggleSidebar = toggleSidebar;
     window.saveTGConfig = saveTGConfig; window.testTG = testTG; window.pushTGNow = pushTGNow; window.refreshTGUsage = refreshTGUsage;
+    window.setupTGWebhook = setupTGWebhook; window.setupTGCommands = setupTGCommands; window.showTGWebhook = showTGWebhook;
     window.openKVValueModal = openKVValueModal; window.editKVKey = editKVKey; window.confirmKVPut = confirmKVPut; window.closeKVValueModal = closeKVValueModal;
     window.openCreateWorker = function(){ el('createName').value=''; el('createName').readOnly = false; el('createScript').value = DEFAULT_WORKER_SCRIPT; window._createScriptSnapshot = DEFAULT_WORKER_SCRIPT; el('createModal').style.display='flex'; };
     window.openEnvFor = function(name){ el('createName').value = name; el('envModal').style.display='flex'; loadEnvVars(name); };
