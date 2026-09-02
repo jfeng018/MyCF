@@ -732,14 +732,16 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定，请在 Worker 绑定设置中添加 KV 命名空间并变量名设为 CF_ACCOUNTS_KV' });
         const { accounts } = payload;
         if (!Array.isArray(accounts)) return json({ success: false, error: 'accounts 必须是数组' });
-        await env.CF_ACCOUNTS_KV.put('accounts', JSON.stringify(accounts));
-        return json({ success: true });
+        const key = await getCryptoKey(env);
+        const toStore = [];
+        for (const a of accounts) { toStore.push(key ? await encJSON(a, key) : a); }
+        await env.CF_ACCOUNTS_KV.put('accounts', JSON.stringify(toStore));
+        return json({ success: true, encrypted: !!key });
       }
 
       case 'load-accounts-kv': {
         if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
-        const raw = await env.CF_ACCOUNTS_KV.get('accounts');
-        const accounts = raw ? JSON.parse(raw) : [];
+        const accounts = await loadKVAccounts(env);
         return json({ success: true, accounts });
       }
 
@@ -764,6 +766,23 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         const cfg = raw ? JSON.parse(raw) : { enabled:true, dailyReport:true, alerts:true };
         const masked = cfg.botToken ? (cfg.botToken.slice(0,4) + '****' + cfg.botToken.slice(-4)) : '';
         return json({ success:true, config: Object.assign({}, cfg, { botToken: masked, botTokenSet: !!cfg.botToken }) });
+      }
+
+      // P0-B 多通道通知配置
+      case 'save-notify-config': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success:false, error:'CF_ACCOUNTS_KV 未绑定' });
+        const nc = payload.config || {};
+        const clean = { discord:{enabled:false}, bark:{enabled:false}, wecom:{enabled:false} };
+        if(nc.discord){ clean.discord = { enabled: !!nc.discord.enabled, webhook: String(nc.discord.webhook||'').trim() }; }
+        if(nc.bark){ clean.bark = { enabled: !!nc.bark.enabled, deviceKey: String(nc.bark.deviceKey||'').trim(), server: String(nc.bark.server||'').trim() }; }
+        if(nc.wecom){ clean.wecom = { enabled: !!nc.wecom.enabled, key: String(nc.wecom.key||'').trim() }; }
+        await env.CF_ACCOUNTS_KV.put('notify_config', JSON.stringify(clean));
+        return json({ success:true });
+      }
+      case 'load-notify-config': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success:false, error:'CF_ACCOUNTS_KV 未绑定' });
+        let nc = {}; try { const r = await env.CF_ACCOUNTS_KV.get('notify_config'); if(r) nc = JSON.parse(r)||{}; } catch(e){}
+        return json({ success:true, config: nc });
       }
 
       case 'push-tg-test': {
@@ -915,11 +934,51 @@ function computeExhaustion(total){
   const eta = new Date(now.getTime() + (remain/rate)*1000);
   return eta.toISOString().slice(11,16) + ' UTC';
 }
+// ---- P1-D 凭据 AES-GCM 加密存储（依赖 Worker secret: SECRET_KEY）----
+async function getCryptoKey(env){
+  const sk = env && env.SECRET_KEY;
+  if(!sk) return null;
+  try {
+    const enc = new TextEncoder();
+    const km = await crypto.subtle.importKey('raw', enc.encode(sk), { name:'PBKDF2' }, false, ['deriveKey']);
+    return await crypto.subtle.deriveKey(
+      { name:'PBKDF2', salt: enc.encode('mycf-v1-salt'), iterations: 100000, hash:'SHA-256' },
+      km, { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']
+    );
+  } catch(e){ return null; }
+}
+function _b64enc(bytes){ let s=''; for(let i=0;i<bytes.length;i++) s+=String.fromCharCode(bytes[i]); return btoa(s); }
+function _b64dec(b64){ const s=atob(b64); const out=new Uint8Array(s.length); for(let i=0;i<s.length;i++) out[i]=s.charCodeAt(i); return out; }
+async function encJSON(obj, key){
+  if(!key) return obj;
+  const enc = new TextEncoder();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const buf = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, enc.encode(JSON.stringify(obj)));
+  const combined = new Uint8Array(iv.length + buf.byteLength);
+  combined.set(iv, 0); combined.set(new Uint8Array(buf), iv.length);
+  return { __enc:true, data:_b64enc(combined) };
+}
+async function decJSON(wrapped, key){
+  if(!wrapped || !wrapped.__enc) return wrapped;
+  if(!key) return null;
+  try {
+    const combined = _b64dec(wrapped.data);
+    const iv = combined.slice(0,12); const ct = combined.slice(12);
+    const buf = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, ct);
+    return JSON.parse(new TextDecoder().decode(buf));
+  } catch(e){ return null; }
+}
 async function loadKVAccounts(env){
   if(!env || !env.CF_ACCOUNTS_KV) return [];
   const raw = await env.CF_ACCOUNTS_KV.get('accounts');
   if(!raw) return [];
-  try { const a = JSON.parse(raw); return Array.isArray(a) ? a : []; } catch(e){ return []; }
+  let arr; try { arr = JSON.parse(raw); } catch(e){ return []; }
+  if(!Array.isArray(arr)) return [];
+  const key = await getCryptoKey(env);
+  if(!key) return arr; // 未配置 SECRET_KEY：明文兼容
+  const out = [];
+  for(const a of arr){ if(a && a.__enc){ const d = await decJSON(a, key); if(d) out.push(d); } else out.push(a); }
+  return out;
 }
 async function getTGConfig(env){
   let botToken = env && env.TG_BOT_TOKEN;
@@ -947,10 +1006,66 @@ async function sendTelegramTo(env, chatId, text){
   }
   return { ok:true };
 }
-async function sendTelegram(env, text){
+async function sendTelegram(env, text, title){
+  return await notify(env, text, title);
+}
+// ---- P0-B 多通道通知层（Telegram + Discord + Bark + 企业微信）----
+function chunkText(text, max){
+  const out=[]; let cur='';
+  const lines = String(text).split('\n');
+  for(let ln of lines){
+    // 超长单行按字符硬切（无换行的超长内容也能分片）
+    while(ln.length > max){ if(cur){ out.push(cur); cur=''; } out.push(ln.slice(0,max)); ln = ln.slice(max); }
+    if((cur + '\n' + ln).length > max){ if(cur) out.push(cur); cur = ln; }
+    else cur = cur ? cur + '\n' + ln : ln;
+  }
+  if(cur) out.push(cur);
+  return out.length?out:[''];
+}
+async function sendDiscord(webhook, text){
+  for(const p of chunkText(text, 1900)){
+    const r = await fetch(webhook, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ content: p }) });
+    if(!r.ok) return { ok:false, error:'Discord '+r.status };
+  }
+  return { ok:true };
+}
+async function sendBark(cfg, text, title){
+  const server = (cfg.server || 'https://api.day.app').replace(/\/$/,'');
+  const url = server + '/' + encodeURIComponent(cfg.deviceKey) + '/' + encodeURIComponent(title||'MyCF') + '/' + encodeURIComponent(String(text).slice(0,4000));
+  try { const r = await fetch(url, { method:'GET' }); const j = await r.json().catch(()=>({})); return { ok: j.code===200 }; } catch(e){ return { ok:false, error:String(e) }; }
+}
+async function sendWeCom(key, text){
+  const url = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=' + encodeURIComponent(key);
+  const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ msgtype:'text', text:{ content: text } }) });
+  const j = await r.json().catch(()=>({})); return { ok: j.errcode===0 };
+}
+async function getNotifyConfig(env){
+  let nc = {}; try { const r = await kvGet(env,'notify_config'); if(r) nc = JSON.parse(r)||{}; } catch(e){}
+  return nc;
+}
+async function notify(env, text, title){
   const cfg = await getTGConfig(env);
-  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置：请在「设置」填写 Bot Token 与 Chat ID' };
-  return sendTelegramTo(env, cfg.chatId, text);
+  const results = [];
+  if(cfg.botToken && cfg.chatId) results.push(await sendTelegramTo(env, cfg.chatId, text));
+  const nc = await getNotifyConfig(env);
+  if(nc.discord && nc.discord.enabled && nc.discord.webhook) results.push(await sendDiscord(nc.discord.webhook, text));
+  if(nc.bark && nc.bark.enabled && nc.bark.deviceKey) results.push(await sendBark(nc.bark, text, title));
+  if(nc.wecom && nc.wecom.enabled && nc.wecom.key) results.push(await sendWeCom(nc.wecom.key, text));
+  // 任一通道送达即视为成功（多通道保活：单通道故障不影响整体）
+  const ok = results.length>0 && results.some(r=>r&&r.ok);
+  return { ok, results };
+}
+// 是否有任一可用通知通道（告警守卫不再仅认 Telegram）
+async function notifReady(env){
+  const cfg = await getTGConfig(env);
+  if(cfg.enabled && cfg.botToken && cfg.chatId) return true;
+  const nc = await getNotifyConfig(env);
+  return !!((nc.discord && nc.discord.enabled && nc.discord.webhook) || (nc.bark && nc.bark.enabled && nc.bark.deviceKey) || (nc.wecom && nc.wecom.enabled && nc.wecom.key));
+}
+function buildAbnormalMsg(list){
+  const L = ['🚫 异常/封号账号（' + list.length + '）'];
+  for(const x of list) L.push('• ' + maskEmail(x.email) + ' → ' + (x.reason||x.status));
+  return L.join('\n');
 }
 function splitTGMessage(text){
   const MAX = 3900; const lines = String(text).split('\n'); const out=[]; let cur='';
@@ -977,12 +1092,29 @@ async function registerTGCommands(env){
   const j = await r.json().catch(()=>({}));
   return { ok: !!j.ok, raw: j };
 }
+// ---- P0-A webhook secret_token 鉴权（社区标准做法）----
+const TG_WEBHOOK_SECRET_KEY = 'tg_webhook_secret';
+async function getTGWebhookSecret(env){
+  if(!env || !env.CF_ACCOUNTS_KV) return null;
+  let s = null; try { s = await env.CF_ACCOUNTS_KV.get(TG_WEBHOOK_SECRET_KEY); } catch(e){}
+  if(!s){
+    // 生成 32 字节随机十六进制密钥并持久化
+    const bytes = new Uint8Array(32);
+    if(typeof crypto !== 'undefined' && crypto.getRandomValues){ crypto.getRandomValues(bytes); }
+    else { for(let i=0;i<32;i++) bytes[i] = Math.floor(Math.random()*256); }
+    s = Array.from(bytes, b => b.toString(16).padStart(2,'0')).join('');
+    try { await env.CF_ACCOUNTS_KV.put(TG_WEBHOOK_SECRET_KEY, s); } catch(e){}
+  }
+  return s;
+}
 async function setTGWebhook(env, webhookUrl){
   const cfg = await getTGConfig(env);
   if(!cfg.botToken) return { ok:false, error:'TG 未配置' };
+  const secret = await getTGWebhookSecret(env);
+  const body = { url: webhookUrl, secret_token: secret, allowed_updates: ['message'] };
   const r = await fetch('https://api.telegram.org/bot' + cfg.botToken + '/setWebhook', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ url: webhookUrl })
+    body: JSON.stringify(body)
   });
   const j = await r.json().catch(()=>({}));
   return { ok: !!j.ok, raw: j };
@@ -1008,6 +1140,12 @@ async function saveTGConfigRaw(env, cfg){
   await env.CF_ACCOUNTS_KV.put('tg_config', JSON.stringify(cfg));
 }
 async function handleTelegramWebhook(request, env){
+  // P0-A: 校验 Telegram 传来的 secret_token 头，杜绝任何人可 POST /telegram
+  const secret = await getTGWebhookSecret(env);
+  if(secret){
+    const h = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+    if(h !== secret) return new Response('Unauthorized', { status: 401 });
+  }
   let update;
   try { update = await request.json(); } catch(e){ return new Response('bad json', { status: 400 }); }
   const cfg = await getTGConfig(env);
@@ -1123,9 +1261,9 @@ function buildQuotaAlert(u, tier){
 }
 async function pushDailyReport(env, force = false){
   const cfg = await getTGConfig(env);
-  if(!cfg.enabled) return { ok:false, error:'TG 未启用' };
+  if(!cfg.enabled) return { ok:false, error:'推送未启用' };
   if(!force && !cfg.dailyReport) return { ok:false, error:'日报未启用（定时开关关闭）' };
-  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置 Bot Token / Chat ID' };
+  if(!(await notifReady(env))) return { ok:false, error:'未配置任何通知通道（TG/多通道其一即可）' };
   const creds = await loadKVAccounts(env);
   if(!creds.length) return { ok:false, error:'KV 中无账号' };
   const results = [];
@@ -1134,13 +1272,19 @@ async function pushDailyReport(env, force = false){
     catch(e){ results.push({ email:c.email, error:String(e) }); }
   }
   const dateStr = new Date().toISOString().slice(0,10);
-  const msg = buildDailyReport(results, dateStr);
+  let msg = buildDailyReport(results, dateStr);
+  // P1-C: 头部标出异常/封号账号，便于一眼发现
+  const accounts = await loadKVAccounts(env);
+  const abnormal = accounts.filter(a=>a.status && a.status!=='ok');
+  if(abnormal.length){
+    msg = buildAbnormalMsg(abnormal.map(a=>({ email:a.email, status:a.status, reason:a.statusReason||a.status }))) + '\n\n' + msg;
+  }
   return await sendTelegram(env, msg);
 }
 async function checkQuotaAlerts(env){
   const cfg = await getTGConfig(env);
   if(!cfg.enabled || !cfg.alerts) return;
-  if(!cfg.botToken || !cfg.chatId) return;
+  if(!(await notifReady(env))) return;
   const creds = await loadKVAccounts(env);
   let state = {};
   if(env && env.CF_ACCOUNTS_KV){ const raw = await env.CF_ACCOUNTS_KV.get('tg_quota_alert'); if(raw){ try{ state = JSON.parse(raw); }catch(e){} } }
@@ -1413,31 +1557,75 @@ async function deployWorkerTo(email, key, accountId, scriptName, scriptSource, m
   return { success: resp.ok, message: resp.ok?'OK':(res.errors?.[0]?.message||'fail') };
 }
 
+// ---- P1-C 封号/异常账号自动检测（运行于监控周期，异常立即告警并落库标记） ----
+async function updateAccountStatuses(env){
+  const accounts = await loadKVAccounts(env);
+  if(!accounts.length) return [];
+  const newly = [];
+  for(const a of accounts){
+    let status='ok', reason='';
+    try {
+      const ar = await cfAny('GET','/accounts', a.email, a.key);
+      if(!ar || !ar.success){
+        const code = ar ? ar.status : 0;
+        if(code===401 || code===403 || (ar && ar.errors && ar.errors[0] && ar.errors[0].code===10000)){
+          status='abnormal'; reason='认证失败/封号（HTTP ' + code + '）';
+        } else if(code!==429){ status='error'; reason='API 错误（HTTP ' + (code||'?') + '）'; }
+      }
+    } catch(e){ status='error'; reason=String(e).slice(0,80); }
+    const prev = a.status || 'ok';
+    if(status!=='ok' && (prev==='ok' || !prev)) newly.push({ email:a.email, status, reason });
+    if(a.status !== status || (a.statusReason||'') !== reason){ a.status = status; if(reason) a.statusReason = reason; else delete a.statusReason; }
+  }
+  const key = await getCryptoKey(env);
+  const toStore = [];
+  for(const a of accounts){ toStore.push(key ? await encJSON(a, key) : a); }
+  if(env && env.CF_ACCOUNTS_KV) await env.CF_ACCOUNTS_KV.put('accounts', JSON.stringify(toStore));
+  return newly;
+}
+// ---- P1-E KV retention 清理（滚动裁剪，防 KV 膨胀） ----
+async function cleanupKV(env){
+  if(!env || !env.CF_ACCOUNTS_KV) return;
+  try {
+    let history = {}; const r = await kvGet(env,'usage_history'); if(r) history = JSON.parse(r)||{};
+    const hk = Object.keys(history).sort(); while(hk.length>60) delete history[hk.shift()];
+    await kvPut(env,'usage_history', history);
+  } catch(e){}
+  try {
+    const r = await kvGet(env,'health_probe'); if(r){ const arr = JSON.parse(r)||[]; if(Array.isArray(arr) && arr.length>200){ await kvPut(env,'health_probe', arr.slice(-200)); } }
+  } catch(e){}
+}
+
 // ---- 编排 ----
 async function runDailyMonitoring(env){
+  const newly = await updateAccountStatuses(env);
+  if(newly.length && await notifReady(env)) await sendTelegram(env, buildAbnormalMsg(newly));
   const cfg = await getTGConfig(env);
   await storeDailySnapshots(env);
   await storeStorageUsage(env);
   const cur = await snapshotAssets(env);
   let prev = null; try { const r = await kvGet(env,'asset_snapshot'); if(r) prev = JSON.parse(r); } catch(e){}
-  if(prev && prev.accounts){ const changes = diffAssets(prev, cur); if(changes.length && cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId) await sendTelegram(env, buildAssetAuditMsg(changes)); }
+  if(prev && prev.accounts){ const changes = diffAssets(prev, cur); if(changes.length && cfg.enabled && cfg.alerts && await notifReady(env)) await sendTelegram(env, buildAssetAuditMsg(changes)); }
   await kvPut(env,'asset_snapshot', cur);
   const certs = await checkCertExpiry(env); await kvPut(env,'cert_expiry', certs);
-  if(cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId){ const due = certs.filter(c=>c.days!==null && c.days<=7); if(due.length) await sendTelegram(env, buildCertMsg(due)); }
+  if(cfg.enabled && cfg.alerts && await notifReady(env)){ const due = certs.filter(c=>c.days!==null && c.days<=7); if(due.length) await sendTelegram(env, buildCertMsg(due)); }
   await heartbeat(env);
 }
 async function runProbeMonitoring(env){
+  const newly = await updateAccountStatuses(env);
+  if(newly.length && await notifReady(env)) await sendTelegram(env, buildAbnormalMsg(newly));
   const cfg = await getTGConfig(env);
   const cur = await probeEndpoints(env);
   let prev = []; try { const r = await kvGet(env,'health_probe'); if(r) prev = JSON.parse(r)||[]; } catch(e){}
   const pmap = Object.fromEntries(prev.map(p=>[p.email+'|'+p.worker, p]));
   const down = cur.filter(p=>!p.ok && pmap[p.email+'|'+p.worker] && pmap[p.email+'|'+p.worker].ok);
-  if(down.length && cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId) await sendTelegram(env, buildProbeMsg(down));
+  if(down.length && cfg.enabled && cfg.alerts && await notifReady(env)) await sendTelegram(env, buildProbeMsg(down));
   await kvPut(env,'health_probe', cur);
   const waf = await checkWaf(env); await kvPut(env,'waf_status', waf);
-  if(cfg.enabled && cfg.alerts && cfg.botToken && cfg.chatId){ const sp = waf.filter(w=>w.blocked>=50000); if(sp.length) await sendTelegram(env, buildWafMsg(sp)); }
+  if(cfg.enabled && cfg.alerts && await notifReady(env)){ const sp = waf.filter(w=>w.blocked>=50000); if(sp.length) await sendTelegram(env, buildWafMsg(sp)); }
   await checkQuotaAlerts(env);
   try { const r = await kvGet(env,'tg_cron_heartbeat'); if(r){ const h = JSON.parse(r); if(!h.warned && Date.now()-h.last > 26*3600*1000){ await sendTelegram(env, '⏰ Cron 心跳异常：日报 cron 已超过 26 小时未运行，可能已被 CF 静默停止，请检查触发器配置。'); await kvPut(env,'tg_cron_heartbeat', Object.assign(h,{warned:true})); } } } catch(e){}
+  await cleanupKV(env);
 }
 
 async function getWorkerScriptInternal(email, key, accountId, scriptName) {
@@ -1538,6 +1726,9 @@ async function cfAny(method, path, email, key, body = null) {
   const res = await fetch(url, opts);
   let data;
   try { data = await res.json(); } catch { data = { success: res.ok }; }
+  // 附上 HTTP 状态码，便于识别封号/凭据失效(401/403)
+  if (typeof data === 'object' && data !== null) { data.status = res.status; }
+  else data = { success: res.ok, status: res.status };
   if (method === 'GET' && !_apiCacheBypass && res.ok) {
     _apiCachePut(url, email, key, data);
   }

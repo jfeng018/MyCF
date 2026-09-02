@@ -14,6 +14,10 @@ kv_namespaces = [
 # TG_BOT_TOKEN = ""
 # TG_CHAT_ID = ""
 
+# 凭据加密（P1-D）：设置后账号 email + Global API Key 会以 AES-GCM 加密存入 KV，读取时解密。
+# 未设置则明文兼容（旧数据不受影响）。建议用 wrangler secret put SECRET_KEY 设置，勿明文提交。
+# SECRET_KEY = ""
+
 # 定时触发器（免费版每账号最多 5 个，这里只用 1 个，其余 4 个留给以后扩展）
 # 单个每小时触发器，在 worker 内按 UTC 小时分支：
 #   - UTC 23 点：每日巡检(历史/存储/资产/证书/心跳) + 当日请求日报(北京 07:xx)
