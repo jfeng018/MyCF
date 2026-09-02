@@ -772,7 +772,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       }
 
       case 'push-tg-now': {
-        const r = await pushDailyReport(env);
+        const r = await pushDailyReport(env, true);
         return json(r.ok ? { success:true } : { success:false, error:r.error });
       }
 
@@ -782,12 +782,12 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         const wh = (payload.webhookUrl && String(payload.webhookUrl).trim()) || (origin ? origin.replace(/\/$/,'') + '/telegram' : '');
         if(!wh) return json({ success:false, error:'无法确定 webhook URL' });
         const r = await setTGWebhook(env, wh);
-        return json(r.ok ? { success:true, webhook: wh } : { success:false, error: r.error || JSON.stringify(r.raw||{}) });
+        return json(r.ok ? { success:true, webhook: wh } : { success:false, error: (r.error || (r.raw && r.raw.description) || JSON.stringify(r.raw||{})) });
       }
 
       case 'get-tg-webhook': {
         const r = await getTGWebhook(env);
-        return json(r.ok ? { success:true, info: r.raw } : { success:false, error: r.error });
+        return json(r.ok ? { success:true, info: r.info } : { success:false, error: r.error });
       }
 
       case 'set-tg-commands': {
@@ -992,10 +992,20 @@ async function getTGWebhook(env){
   if(!cfg.botToken) return { ok:false, error:'TG 未配置' };
   const r = await fetch('https://api.telegram.org/bot' + cfg.botToken + '/getWebhookInfo', { method:'GET' });
   const j = await r.json().catch(()=>({}));
-  return { ok: !!j.ok, raw: j };
+  const info = j.result || {};
+  return { ok: !!j.ok, info: {
+    url: info.url || '',
+    pending_update_count: info.pending_update_count || 0,
+    last_error: info.last_error_message || '',
+    last_error_date: info.last_error_date || ''
+  } };
 }
 function tgHelpText(){
   return '🤖 MyCF 机器人指令：\n/report - 立即推送每日用量报告\n/probe - 立即执行端点探活并推送状态\n/help - 显示本帮助';
+}
+async function saveTGConfigRaw(env, cfg){
+  if(!env || !env.CF_ACCOUNTS_KV) return;
+  await env.CF_ACCOUNTS_KV.put('tg_config', JSON.stringify(cfg));
 }
 async function handleTelegramWebhook(request, env){
   let update;
@@ -1006,14 +1016,26 @@ async function handleTelegramWebhook(request, env){
   if(msg){ chatId = msg.chat && msg.chat.id; text = msg.text || ''; }
   else if(cb){ chatId = cb.message && cb.message.chat && cb.message.chat.id; text = cb.data || ''; }
   if(!chatId) return new Response('ok', { status: 200 });
-  // 仅响应已配置 Chat ID 的会话，避免陌生人触发
-  if(cfg.chatId && String(cfg.chatId) !== String(chatId)) return new Response('ok', { status: 200 });
   const t = (text||'').trim();
+  // 配对/绑定：/start 或 /bind 始终把当前聊天绑定为接收者（自愈填错的 Chat ID）
+  if(t === '/start' || t === '/bind' || t === 'bind'){
+    if(String(cfg.chatId||'') !== String(chatId)){
+      try { cfg.chatId = String(chatId); await saveTGConfigRaw(env, cfg); } catch(e){}
+    }
+    await sendTelegramTo(env, chatId, tgHelpText());
+    return new Response('ok', { status: 200 });
+  }
+  // 其余指令：未绑定 Chat ID 时自动绑定首次来讯；已绑定则仅响应本聊天（陌生人不会触发）
+  if(!cfg.chatId){
+    try { cfg.chatId = String(chatId); await saveTGConfigRaw(env, cfg); } catch(e){}
+  } else if(String(cfg.chatId) !== String(chatId)){
+    return new Response('ok', { status: 200 });
+  }
   try {
-    if(t === '/start' || t === '/help' || t === 'help' || t === '菜单'){
+    if(t === '/help' || t === 'help' || t === '菜单'){
       await sendTelegramTo(env, chatId, tgHelpText());
     } else if(t === '/report' || t === 'report'){
-      const r = await pushDailyReport(env);
+      const r = await pushDailyReport(env, true);
       if(!r.ok) await sendTelegramTo(env, chatId, '❌ 日报推送失败：' + (r.error||''));
     } else if(t === '/probe' || t === 'probe'){
       await sendTelegramTo(env, chatId, '⏳ 正在执行端点探活...');
@@ -1099,10 +1121,11 @@ function buildQuotaAlert(u, tier){
   const etaStr = eta ? ('\n预计打满(UTC): ' + eta) : '';
   return '⚠️ 配额告警 [' + tier + '%]\n' + masked + ' 已用 ' + fmtNum(u.total) + ' / 100,000 (' + u.percent.toFixed(1) + '%)' + etaStr;
 }
-async function pushDailyReport(env){
+async function pushDailyReport(env, force = false){
   const cfg = await getTGConfig(env);
-  if(!cfg.enabled || !cfg.dailyReport) return { ok:false, error:'日报未启用' };
-  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置' };
+  if(!cfg.enabled) return { ok:false, error:'TG 未启用' };
+  if(!force && !cfg.dailyReport) return { ok:false, error:'日报未启用（定时开关关闭）' };
+  if(!cfg.botToken || !cfg.chatId) return { ok:false, error:'TG 未配置 Bot Token / Chat ID' };
   const creds = await loadKVAccounts(env);
   if(!creds.length) return { ok:false, error:'KV 中无账号' };
   const results = [];
@@ -3537,7 +3560,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     }
     async function showTGWebhook(){
       const r = await api('get-tg-webhook', {});
-      if(r && r.success){ const info = r.info||{}; showNotification('Webhook: ' + (info.url||'未设置') + '  待处理更新: ' + (info.pending_update_count||0)); }
+      if(r && r.success){ const info = r.info||{}; const err = info.last_error ? ('  ⚠️ 最近错误: '+info.last_error) : ''; showNotification('Webhook: ' + (info.url||'未设置') + '  待处理更新: ' + (info.pending_update_count||0) + err); }
       else showNotification((r&&r.error)||'获取失败', 'error');
     }
     // ================= 监控中心 =================
