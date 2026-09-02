@@ -840,16 +840,19 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
 // ---------------- Telegram 推送 ----------------
 function fmtNum(n){ return (n||0).toLocaleString('en-US'); }
 function maskEmail(e){
+  e = String(e||'').replace(/^[\s\u200B-\u200D\uFEFF]+|[\s\u200B-\u200D\uFEFF]+$/g,'');
   if(!e) return '未知';
-  const i = String(e).indexOf('@');
+  const i = e.indexOf('@');
   if(i <= 0) return '未知';
   const u = e.slice(0,i), d = e.slice(i+1);
   if(u.length <= 1) return '*@' + d;
   return u.slice(0,1) + '***@' + d;
 }
-function quotaBar(pct){
-  const n = Math.max(0, Math.min(10, Math.round((pct||0)/10)));
-  return '█'.repeat(n) + '░'.repeat(10-n);
+function relBar(val, max, width){
+  const w = width || 16;
+  if(!max || !val) return '░'.repeat(w);
+  const n = Math.min(w, Math.max(1, Math.round(val/max*w)));
+  return '█'.repeat(n) + '░'.repeat(w-n);
 }
 function computeExhaustion(total){
   if(!total || total <= 0) return null;
@@ -933,29 +936,42 @@ async function queryAllUsageForCred(env, cred){
   return out;
 }
 function buildDailyReport(results, dateStr){
-  const totalReq = results.reduce((t,r)=>t+(r.total||0),0);
+  const ok = results.filter(r=>!r.error).sort((a,b)=>(b.total||0)-(a.total||0));
+  const fail = results.filter(r=>r.error);
+  const totalReq = ok.reduce((t,r)=>t+(r.total||0),0);
+  const maxTotal = ok.reduce((t,r)=>Math.max(t,(r.total||0)),0);
+  const ranks = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩'];
   const L = [];
   L.push('📊 MyCF 每日请求报告');
-  L.push('日期(UTC): ' + dateStr);
-  L.push('账号数: ' + results.length + '  当日总请求: ' + fmtNum(totalReq));
-  L.push('────────────────────');
-  for(const r of results){
+  L.push('🗓 ' + dateStr + ' (UTC)');
+  L.push('👥 ' + results.length + ' 个账号   ·   总请求 ' + fmtNum(totalReq));
+  L.push('════════════════════════');
+  ok.forEach((r,idx)=>{
     const masked = maskEmail(r.email);
-    const name = r.name ? ' (' + r.name + ')' : '';
-    if(r.error){ L.push(''); L.push('▌' + masked + name); L.push('  查询失败: ' + r.error); continue; }
+    const name = r.name ? ' · ' + r.name : '';
+    const pct = r.percent || 0;
+    const share = totalReq > 0 ? (r.total/totalReq*100) : 0;
+    const rank = ranks[idx] || ((idx+1) + '.');
     L.push('');
-    L.push('▌' + masked + name);
-    L.push(' ' + fmtNum(r.total) + ' / 100,000 (' + r.percent.toFixed(1) + '%)');
-    L.push(' ' + quotaBar(r.percent));
-    L.push(' Workers: ' + fmtNum(r.workers) + '  Pages: ' + fmtNum(r.pages));
+    L.push(rank + ' ' + masked + name);
+    L.push('   ' + fmtNum(r.total) + ' / 100,000  (' + pct.toFixed(1) + '%)');
+    L.push('   ' + relBar(r.total, maxTotal, 16) + '  ' + share.toFixed(0) + '% 占比');
+    L.push('   Workers ' + fmtNum(r.workers) + '  ·  Pages ' + fmtNum(r.pages));
     if(r.byScript && r.byScript.length){
-      L.push(' Top Workers:');
-      r.byScript.slice(0,5).forEach(s=> L.push('  • ' + s.script + ': ' + fmtNum(s.requests)));
+      const top = r.byScript.slice(0,5).map(s=> s.script + ' ' + fmtNum(s.requests)).join(' · ');
+      L.push('   Top: ' + top);
     }
-  }
+  });
+  fail.forEach(r=>{
+    const masked = maskEmail(r.email);
+    const name = r.name ? ' · ' + r.name : '';
+    L.push('');
+    L.push('⚠ ' + masked + name);
+    L.push('   查询失败: ' + (r.error||'未知错误'));
+  });
   L.push('');
-  L.push('────────────────────');
-  L.push('由 MyCF 自动推送 · 配额按 UTC 重置');
+  L.push('────────────────────────');
+  L.push('由 MyCF 自动推送 · 配额每日 UTC 重置');
   return L.join('\n');
 }
 function buildQuotaAlert(u, tier){
