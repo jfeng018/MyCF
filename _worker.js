@@ -12,7 +12,7 @@
 
 export default {
   async fetch(request, env, ctx) {
-    return await handleRequest(request, env);
+    return await handleRequest(request, env, ctx);
   },
   async scheduled(event, env, ctx) {
     try {
@@ -33,10 +33,33 @@ export default {
 
 // 兼容旧版 Worker 环境
 addEventListener('fetch', (event) => {
-  event.respondWith(handleRequest(event.request, null));
+  event.respondWith(handleRequest(event.request, null, event));
 });
 
 const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
+
+// ---------------- 边缘缓存（降低 Cloudflare API 调用频率，规避限流） ----------------
+// 用 Cache API 在边缘缓存只读 GET 响应：跨 isolate / 区域命中，且不消耗 KV 写入额度（免费版仅 1000 写/日）。
+let _ctxWaitUntil = null;     // 由 fetch 入口注入，用于缓存写入不阻塞主响应
+let _apiCacheBypass = false;  // 由 API 请求的 payload.forceRefresh 控制，跳过缓存拿实时数据
+const _apiCache = caches.default;
+const API_CACHE_TTL = 30;     // 秒；与个人面板刷新频率匹配，写操作后最多 30s 可见新数据
+async function _apiCacheGet(url, email, key) {
+  try {
+    const req = new Request(url, { method: 'GET', headers: { 'X-Auth-Email': email, 'X-Auth-Key': key } });
+    const res = await _apiCache.match(req);
+    if (!res) return null;
+    return await res.json();
+  } catch (e) { return null; }
+}
+async function _apiCachePut(url, email, key, data) {
+  try {
+    const req = new Request(url, { method: 'GET', headers: { 'X-Auth-Email': email, 'X-Auth-Key': key } });
+    const res = new Response(JSON.stringify(data), { status: 200, headers: { 'content-type': 'application/json', 'Cache-Control': 'max-age=' + API_CACHE_TTL } });
+    const p = _apiCache.put(req, res);
+    if (_ctxWaitUntil) _ctxWaitUntil(p); else await p;
+  } catch (e) {}
+}
 
 // ---------------- Router ----------------
 // -------- 密码保护辅助 --------
@@ -51,7 +74,8 @@ function getSessionToken(request) {
   return m ? m[1] : null;
 }
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
+  _ctxWaitUntil = (ctx && typeof ctx.waitUntil === 'function') ? ctx.waitUntil.bind(ctx) : null;
   const url = new URL(request.url);
   const p = url.pathname;
   const hasPassword = !!(env && env.ACCESS_PASSWORD);
@@ -128,6 +152,7 @@ async function handleRequest(request, env) {
 async function handleAPI(req, env) {
   const payload = await safeJSON(req);
   const action = payload.action;
+  _apiCacheBypass = !!payload.forceRefresh; // 强制刷新时跳过边缘缓存
   if (!action) return json({ success:false, error:'action required' }, 400);
 
   if (action === 'fetch-external-script') {
@@ -785,7 +810,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       case 'get-usage-trend': {
         let history = {}; try { const r = await kvGet(env,'usage_history'); if(r) history = JSON.parse(r)||{}; } catch(e){}
         const credsN = (await loadKVAccounts(env)).length;
-        return json({ success:true, trend: computeUsageTrend(history, 30), prediction: predictExhaustion(history, credsN) });
+        return json({ success:true, trend: computeUsageTrend(history, 30), accounts: computeAccountTrends(history, 30), prediction: predictExhaustion(history, credsN) });
       }
       case 'run-monitor-now': {
         await runDailyMonitoring(env);
@@ -1138,6 +1163,21 @@ function computeUsageTrend(history, days){
   const dates = Object.keys(history||{}).sort().slice(-days);
   return dates.map(d => ({ date:d, total:(history[d]||[]).reduce((t,r)=>t+(r.total||0),0) }));
 }
+function computeAccountTrends(history, days){
+  const dates = Object.keys(history||{}).sort().slice(-days);
+  const map = {};
+  for (const d of dates) {
+    for (const r of (history[d]||[])) {
+      const key = r.email || r.accountId || 'unknown';
+      if (!map[key]) map[key] = { email:key, name:r.name||maskEmail(key), byDate:{} };
+      map[key].byDate[d] = (map[key].byDate[d]||0) + (r.total||0);
+    }
+  }
+  return Object.values(map).map(a => ({
+    email:a.email, name:a.name,
+    series: dates.map(d => ({ date:d, total: a.byDate[d]||0 }))
+  }));
+}
 function predictExhaustion(history, numAccounts){
   const series = computeUsageTrend(history, 14);
   if(series.length < 3) return null;
@@ -1467,8 +1507,18 @@ async function cfAny(method, path, email, key, body = null) {
     headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
+  // 只读 GET 走边缘缓存，降低 Cloudflare API 频率、规避限流
+  if (method === 'GET' && !_apiCacheBypass) {
+    const cached = await _apiCacheGet(url, email, key);
+    if (cached !== null) return cached;
+  }
   const res = await fetch(url, opts);
-  try { return await res.json(); } catch { return { success: res.ok }; }
+  let data;
+  try { data = await res.json(); } catch { data = { success: res.ok }; }
+  if (method === 'GET' && !_apiCacheBypass && res.ok) {
+    _apiCachePut(url, email, key, data);
+  }
+  return data;
 }
 
 function json(obj, status=200) {
@@ -2159,6 +2209,11 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
           <h2 style="margin:0 0 8px">存储限额监控</h2>
           <div id="storageBox" class="small" style="white-space:pre-wrap;font-family:monospace">加载中...</div>
         </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2 style="margin:0 0 8px">各账号用量趋势（近 30 天）</h2>
+        <div id="accountTrendBox" class="small">加载中...</div>
       </div>
 
       <div class="grid" style="margin-top:16px">
@@ -3497,11 +3552,25 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       const labels = series.filter((_,i)=>i%Math.ceil(series.length/6)===0).map((s,i)=>{ const x = pad + i*stepX*Math.ceil(series.length/6); return '<text x="'+Math.min(w-pad,x).toFixed(1)+'" y="'+(h-8)+'" font-size="9" fill="#94a3b8">'+s.date.slice(5)+'</text>'; }).join('');
       box.innerHTML = '<svg viewBox="0 0 '+w+' '+h+'" width="100%" style="max-width:600px">'+bars+'<polyline points="'+pts.join(' ')+'" fill="none" stroke="#00d4ff" stroke-width="2"/>'+labels+'</svg>';
     }
+    function renderAccountTrends(list){
+      const box = el('accountTrendBox');
+      if(!list || !list.length){ box.textContent = '暂无按账号的历史数据（需 Cron 每日快照运行至少一天）'; return; }
+      const max = Math.max(1, ...list.flatMap(a=>a.series.map(s=>s.total)));
+      box.innerHTML = list.map(a => {
+        const w=240,h=44,pad=4,n=a.series.length,stepX=(w-pad*2)/Math.max(1,n-1);
+        const pts=a.series.map((s,i)=>{ const x=pad+i*stepX; const y=h-pad-(s.total/max)*(h-pad*2); return x.toFixed(1)+','+y.toFixed(1); }).join(' ');
+        const last=a.series[n-1]?a.series[n-1].total:0;
+        const peak=a.series.reduce((m,s)=>Math.max(m,s.total),0);
+        const pct=peak>0?Math.round(last/peak*100):0;
+        return '<div style="display:flex;align-items:center;gap:8px;margin:5px 0"><div style="width:190px;font-size:12px;color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+escapeHtml(a.name)+'">'+escapeHtml(a.name)+'</div><svg viewBox="0 0 '+w+' '+h+'" width="240" height="44" style="background:#f8fafc;border-radius:6px;flex:none"><polyline points="'+pts+'" fill="none" stroke="#0070f3" stroke-width="1.5"/></svg><div style="font-size:12px;color:#0f172a;min-width:70px;text-align:right">'+last.toLocaleString()+'<span style="color:#94a3b8"> ('+pct+'%)</span></div></div>';
+      }).join('');
+    }
     async function loadMonitor(){
       try {
         const t = await api('get-usage-trend', {});
         if(t && t.success){
           renderTrendChart(t.trend);
+          renderAccountTrends(t.accounts);
           const p = t.prediction;
           el('trendPrediction').textContent = p ? ('预测: ' + p.trend + (p.daysToLimit!=null ? ('，日均增长 '+p.dailyGrowth + '，约 ' + p.daysToLimit + ' 天后接近上限 (' + p.eta + ')') : '，暂无需担心')) : '数据不足，无法预测';
         }
