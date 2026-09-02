@@ -938,25 +938,22 @@ async function queryAllUsageForCred(env, cred){
 function buildDailyReport(results, dateStr){
   const ok = results.filter(r=>!r.error).sort((a,b)=>(b.total||0)-(a.total||0));
   const fail = results.filter(r=>r.error);
-  const totalReq = ok.reduce((t,r)=>t+(r.total||0),0);
-  const maxTotal = ok.reduce((t,r)=>Math.max(t,(r.total||0)),0);
   const ranks = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩'];
   const L = [];
   L.push('📊 MyCF 每日请求报告');
   L.push('🗓 ' + dateStr + ' (UTC)');
   const acctLabel = fail.length ? (ok.length + ' 个有效（共 ' + results.length + ' 个）') : (results.length + ' 个账号');
-  L.push('👥 ' + acctLabel + '   ·   总请求 ' + fmtNum(totalReq));
+  L.push('👥 ' + acctLabel);
   L.push('════════════════════════');
   ok.forEach((r,idx)=>{
     const masked = maskEmail(r.email);
     const name = r.name ? ' · ' + r.name : '';
     const pct = r.percent || 0;
-    const share = totalReq > 0 ? (r.total/totalReq*100) : 0;
     const rank = ranks[idx] || ((idx+1) + '.');
     L.push('');
     L.push(rank + ' ' + masked + name);
     L.push('   ' + fmtNum(r.total) + ' / 100,000  (' + pct.toFixed(1) + '%)');
-    L.push('   ' + relBar(r.total, maxTotal, 16) + '  ' + share.toFixed(0) + '% 占比');
+    L.push('   ' + relBar(r.total, 100000, 16) + '  额度用量');
     L.push('   Workers ' + fmtNum(r.workers) + '  ·  Pages ' + fmtNum(r.pages));
     if(r.byScript && r.byScript.length){
       const top = r.byScript.slice(0,5).map(s=> s.script + ' ' + fmtNum(s.requests)).join(' · ');
