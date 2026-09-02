@@ -16,13 +16,13 @@ export default {
   },
   async scheduled(event, env, ctx) {
     try {
-      const cron = event.cron || '';
-      // 每日 UTC 23:55：监控巡检（历史/存储/资产/证书/心跳）+ 当日请求日报（北京时间 07:55，配额 UTC 重置前）
-      if (cron === '55 23 * * *') {
+      const utcHour = new Date().getUTCHours();
+      await heartbeat(env);
+      if (utcHour === 23) {
         await runDailyMonitoring(env);
         await pushDailyReport(env);
-      } else {
-        // 其余触发（每 4 小时）= 探活 + WAF + 配额告警 + 心跳校验
+      }
+      if (utcHour % 4 === 3 && utcHour !== 23) {
         await runProbeMonitoring(env);
       }
     } catch (e) {
@@ -1597,9 +1597,41 @@ input:checked + .slider:before{transform:translateX(16px)}
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.1); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.2); }
+
+/* ===== UI 增强：暗色 / 响应式 / 加载态 / 确认弹窗 / 搜索 ===== */
+.spinner{width:14px;height:14px;border:2px solid var(--muted);border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.last-updated{font-size:11px;color:var(--muted)}
+.list-search{width:200px;max-width:50vw}
+.sort-ind:hover{color:var(--accent);cursor:pointer}
+.sort-ind::after{content:' \\2195';opacity:.45;font-size:11px}
+.confirm-box{width:460px}
+.hamburger{display:none}
+body.dark{--bg:#0f172a;--card:rgba(30,41,59,0.7);--muted:#94a3b8;--text:#e2e8f0;--border:rgba(255,255,255,0.12);--accent:#38bdf8;--accent2:#22d3ee;--shadow:0 8px 32px rgba(0,0,0,0.45)}
+body.dark{background:linear-gradient(135deg,#0f172a,#1e293b)}
+body.dark .sidebar{background:rgba(15,23,42,0.72)}
+body.dark .metric,body.dark .card,body.dark .kv-item,body.dark .worker-row,body.dark .zone-row,body.dark .acct-row,body.dark .ns-pill,body.dark .domain-tag{background:rgba(30,41,59,0.55)}
+body.dark pre,body.dark .sql-console,body.dark .sql-results{background:#0b1220;color:#cbd5e1}
+body.dark .input{background:rgba(15,23,42,0.6);color:var(--text)}
+body.dark .input:focus{background:#0b1220}
+body.dark .modal-box{background:rgba(30,41,59,0.96)}
+body.dark .log-area{background:#020617}
+body.dark .res-tag{filter:brightness(1.1)}
+body.dark .domain-status.active{background:rgba(16,185,129,0.18)}
+body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
+@media (max-width: 860px){
+  .hamburger{display:block;position:fixed;top:12px;left:12px;z-index:60;width:40px;height:40px;border-radius:10px;background:var(--card);border:1px solid var(--border);color:var(--text);font-size:18px;cursor:pointer;box-shadow:var(--shadow)}
+  .sidebar{position:fixed;left:0;top:0;bottom:0;z-index:55;transform:translateX(-100%);transition:transform .25s ease;box-shadow:0 0 40px rgba(0,0,0,.35)}
+  .sidebar.open{transform:none}
+  .main{padding:64px 16px 16px}
+  .nav .item{font-size:14px}
+  .list-search{width:130px}
+  .header{flex-direction:column;align-items:flex-start;gap:10px}
+}
 </style>
 </head>
 <body data-page="app">
+    <button class="hamburger" id="hamburgerBtn" onclick="toggleSidebar()" aria-label="菜单">&#9776;</button>
 <div class="app">
   <aside class="sidebar">
     <div class="logo"><span style="font-size:18px">cloudflare</span>管理平台</div>
@@ -1625,6 +1657,14 @@ input:checked + .slider:before{transform:translateX(16px)}
          <span onclick="openAccountSwitcher()" style="cursor:pointer;text-decoration:underline">切换</span>
          <span onclick="logout()" style="cursor:pointer;color:#ef4444">退出</span>
        </div>
+       <div style="margin-top:10px;display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)">
+         <span id="globalBusy" class="spinner" style="display:none"></span>
+         <span id="lastUpdated" class="last-updated"></span>
+       </div>
+       <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
+         <button class="btn small" id="darkToggle" onclick="toggleDark()">暗色</button>
+         <button class="btn small" onclick="restoreFromKV()">从 KV 同步</button>
+       </div>
     </div>
   </aside>
 
@@ -1633,7 +1673,8 @@ input:checked + .slider:before{transform:translateX(16px)}
     <div id="workers-page" class="page-content active">
       <div class="header">
         <div style="font-size:20px;font-weight:700">Workers 管理</div>
-        <div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="workerSearch" class="input list-search" placeholder="搜索 Worker / 域名" oninput="filterRows('workersList', this.value)">
           <button class="btn primary" onclick="openCreateWorker()">新建 Worker</button>
         </div>
       </div>
@@ -1798,7 +1839,8 @@ input:checked + .slider:before{transform:translateX(16px)}
     <div id="kv-page" class="page-content">
       <div class="header">
         <div style="font-size:20px;font-weight:700">Workers KV 管理</div>
-        <div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="kvSearch" class="input list-search" placeholder="搜索命名空间" oninput="filterRows('kvNamespacesList', this.value)">
           <button class="btn primary" onclick="openCreateKVNamespace()">创建 KV 命名空间</button>
         </div>
       </div>
@@ -1814,7 +1856,8 @@ input:checked + .slider:before{transform:translateX(16px)}
     <div id="d1-page" class="page-content">
       <div class="header">
         <div style="font-size:20px;font-weight:700">D1 数据库管理</div>
-        <div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="d1Search" class="input list-search" placeholder="搜索数据库" oninput="filterRows('d1DatabasesList', this.value)">
           <button class="btn primary" onclick="openCreateD1Database()">创建 D1 数据库</button>
         </div>
       </div>
@@ -1845,7 +1888,8 @@ input:checked + .slider:before{transform:translateX(16px)}
     <div id="dns-page" class="page-content">
       <div class="header">
         <div style="font-size:20px;font-weight:700">域名管理</div>
-        <div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="zoneSearch" class="input list-search" placeholder="搜索域名" oninput="filterRows('zonesList', this.value)">
           <button class="btn primary" onclick="openAddZone()">添加新域名</button>
         </div>
       </div>
@@ -1863,6 +1907,7 @@ input:checked + .slider:before{transform:translateX(16px)}
             <div class="small" id="selectedZoneInfo">管理选定域名的 DNS 记录</div>
           </div>
           <div class="zone-actions">
+            <input id="dnsSearch" class="input list-search" placeholder="搜索记录" oninput="filterRows('dnsRecordsList', this.value)">
             <button class="btn primary" onclick="openAddDNSRecord()">添加 DNS 记录</button>
             <button class="btn" onclick="backToZones()">返回域名列表</button>
           </div>
@@ -2061,7 +2106,17 @@ input:checked + .slider:before{transform:translateX(16px)}
      <h3 style="margin:0">切换账号</h3>
      <button class="trash-btn" onclick="closeAccountSwitcher()">✕</button>
   </div>
+  <div style="margin-bottom:12px"><button class="btn small" onclick="restoreFromKV()">从 KV 恢复账号</button></div>
   <div id="accountListContainer"></div>
+</div></div>
+
+<div id="confirmModal" class="modal" style="display:none"><div class="modal-box confirm-box">
+  <h3 id="confirmTitle" style="margin:0 0 10px">请确认</h3>
+  <div id="confirmMsg" class="small" style="margin:0 0 20px;white-space:pre-wrap"></div>
+  <div style="display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn" id="confirmCancel">取消</button>
+    <button class="btn danger" id="confirmOk">确定</button>
+  </div>
 </div></div>
 
 <div id="envModal" class="modal" style="display:none"><div class="modal-box">
@@ -2285,7 +2340,7 @@ function renderStaticJS(env) {
   (async function(){ if(document.body.dataset.page==='login' && getActiveCreds().email){ try{ const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'check-features'})}); if(r.ok) location.replace('/workers'); }catch(e){} } })();
   
   function loadSaved(){ try { return JSON.parse(localStorage.getItem('cf_accounts')||'[]'); } catch(e){ return []; } }
-  function saveAccounts(arr){ localStorage.setItem('cf_accounts', JSON.stringify(arr)); }
+  function saveAccounts(arr){ localStorage.setItem('cf_accounts', JSON.stringify(arr)); fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'save-accounts-kv', accounts: arr }) }).catch(()=>{}); }
 
   const BATCH_CONFIG = {
     urls: ${safeUrls},
@@ -2343,12 +2398,44 @@ function renderStaticJS(env) {
     });
   }
 
+  let _busy = 0;
+  function updateBusy(){ const b = el('globalBusy'); if (b) b.style.display = _busy > 0 ? 'inline-block' : 'none'; }
+  function stampRefresh(){ const s = el('lastUpdated'); if (s) s.textContent = '最后更新 ' + new Date().toLocaleTimeString('zh-CN', { hour12:false }); }
   async function api(action, body) {
-    const c = getActiveCreds();
-    const payload = Object.assign({ action }, c, body);
-    const r = await fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-    try { return await r.json(); } catch (e) { return await r.text(); }
+    _busy++; updateBusy();
+    try {
+      const c = getActiveCreds();
+      const payload = Object.assign({ action }, c, body);
+      const r = await fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      try { const j = await r.json(); stampRefresh(); return j; } catch (e) { return await r.text(); }
+    } finally { _busy--; updateBusy(); }
   }
+
+  function ensureConfirmModal(){
+    let box = el('confirmModal');
+    if (box) return box;
+    box = document.createElement('div');
+    box.id = 'confirmModal'; box.className = 'modal'; box.style.display = 'none';
+    box.innerHTML = '<div class="modal-box confirm-box">' +
+      '<h3 id="confirmTitle" style="margin:0 0 10px">请确认</h3>' +
+      '<div id="confirmMsg" class="small" style="margin:0 0 20px;white-space:pre-wrap"></div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end">' +
+      '<button class="btn" id="confirmCancel">取消</button>' +
+      '<button class="btn danger" id="confirmOk">确定</button></div></div>';
+    document.body.appendChild(box);
+    return box;
+  }
+  function confirmDialog(msg, onYes, title){
+    const box = ensureConfirmModal();
+    el('confirmMsg').textContent = msg;
+    el('confirmTitle').textContent = title || '请确认';
+    box.style.display = 'flex';
+    const ok = el('confirmOk'), cancel = el('confirmCancel');
+    const done = (yes) => { box.style.display = 'none'; ok.onclick = null; cancel.onclick = null; if (yes) onYes(); };
+    ok.onclick = () => done(true);
+    cancel.onclick = () => done(false);
+  }
+  window.confirmDialog = confirmDialog;
 
   const page = document.body && document.body.dataset && document.body.dataset.page;
   
@@ -2419,13 +2506,11 @@ function renderStaticJS(env) {
            saveAccounts(current); renderSaved(); el('batchLoginModal').style.display='none'; el('batchLoginInput').value = ''; showNotification(\`已导入 \${newAccs.length} 个账号\`);
        } else { alert('未解析到有效账号，请检查格式'); }
     });
-    document.getElementById('clearBtn').addEventListener('click', function(){ if(confirm('清除保存的账号？')){ localStorage.removeItem('cf_accounts'); renderSaved(); } });
+    document.getElementById('clearBtn').addEventListener('click', function(){ confirmDialog('确定清除所有保存的账号？KV 中也会一并清空，不可恢复。', () => { saveAccounts([]); renderSaved(); }); });
 
     // ===== 密码保护 + KV 账号同步 =====
-    function saveAccounts(arr) {
-      localStorage.setItem('cf_accounts', JSON.stringify(arr));
-      fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'save-accounts-kv', accounts: arr }) }).catch(()=>{});
-    }
+    // saveAccounts 已提到外层公共区（同时写 localStorage 与 KV）
+
 
     window.submitPw = async function() {
       const pw = document.getElementById('pwInput').value;
@@ -2500,7 +2585,7 @@ function renderStaticJS(env) {
       el('accountModal').style.display = 'flex';
     }
     function switchAccount(idx) { const arr = loadSaved(); if (arr[idx]) { localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); localStorage.removeItem('cf_accountId'); showNotification('正在切换账号...'); setTimeout(() => location.reload(), 500); } }
-    function removeAccount(idx) { if(!confirm('确定要移除此账号吗？')) return; const arr = loadSaved(); arr.splice(idx, 1); saveAccounts(arr); openAccountSwitcher(); }
+    function removeAccount(idx) { confirmDialog('确定移除该账号？KV 中同名账号也会一并移除。', () => { const arr = loadSaved(); arr.splice(idx, 1); saveAccounts(arr); openAccountSwitcher(); }); }
     function closeAccountSwitcher() { el('accountModal').style.display = 'none'; }
 
     function navTo(page) {
@@ -2509,6 +2594,7 @@ function renderStaticJS(env) {
       const activeNav = Array.from(document.querySelectorAll('.nav .item')).find(i => i.dataset.page === page);
       const activePage = el(page + '-page');
       if (activeNav) activeNav.classList.add('active'); if (activePage) activePage.classList.add('active');
+      const sb = document.querySelector('.sidebar'); if (sb) sb.classList.remove('open');
       switch(page) {
         case 'workers': refreshWorkers(); break;
         case 'batch': renderBatchPage(); break; case 'pages': renderPagesBatchPage(); break; case 'pages-manager': refreshPagesManager(); break;
@@ -2519,6 +2605,44 @@ function renderStaticJS(env) {
         case 'settings': loadSubdomainSettings(); break;
       }
     }
+
+    // ===== UI 增强：账号徽标 / 暗色 / 抽屉 / 确认弹窗 / 搜索排序 / 键盘 =====
+    function maskEmailShort(e){ const i = String(e||'').indexOf('@'); if (i <= 0) return e||'未登录'; const u = e.slice(0,i), d = e.slice(i+1); return (u.length <= 1 ? '*' : u.slice(0,1)+'***') + '@' + d; }
+    function updateAcctBadge(){ const a = getActiveCreds(); const el1 = el('acctInfo'); if (el1) el1.textContent = a.email ? maskEmailShort(a.email) : '未登录'; }
+    function toggleSidebar(){ const s = document.querySelector('.sidebar'); if (s) s.classList.toggle('open'); }
+    function closeAllModals(){ document.querySelectorAll('.modal').forEach(m => { if (m.id !== 'accountModal') m.style.display = 'none'; }); }
+    // confirmDialog / closeAllModals 已在顶层公共区定义
+    function toggleDark(){
+      const dark = document.body.classList.toggle('dark');
+      localStorage.setItem('mycf_dark', dark ? '1' : '0');
+      const t = el('darkToggle'); if (t) t.textContent = dark ? '浅色' : '暗色';
+    }
+    window.toggleDark = toggleDark;
+    async function restoreFromKV(){ try { const r = await fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'load-accounts-kv' }) }); const d = await r.json(); if (d.success && d.accounts && d.accounts.length) { const local = loadSaved(); const merged = d.accounts.slice(); local.forEach(a => { if (!merged.find(x => x.email === a.email)) merged.push(a); }); localStorage.setItem('cf_accounts', JSON.stringify(merged)); showNotification('已从 KV 恢复 ' + merged.length + ' 个账号'); updateAcctBadge(); openAccountSwitcher(); } else { showNotification('KV 中暂无账号', 'error'); } } catch(e){ showNotification('恢复失败', 'error'); } }
+    function filterRows(containerId, q){ const c = el(containerId); if (!c) return; q = (q||'').toLowerCase().trim(); const rows = c.querySelectorAll('.worker-row, .kv-item, tbody tr'); if (!q) { rows.forEach(r => r.style.display = ''); return; } rows.forEach(r => { r.style.display = (r.textContent||'').toLowerCase().includes(q) ? '' : 'none'; }); }
+    function sortTable(th, idx, type){ const table = th.closest('table'); if (!table) return; const tbody = table.querySelector('tbody'); const rows = Array.from(tbody.querySelectorAll('tr')); const asc = th.dataset.asc !== '1'; rows.sort((a,b) => { const va = (a.children[idx].textContent||'').trim(); const vb = (b.children[idx].textContent||'').trim(); let c = 0; if (type === 'num') { c = (parseFloat((va||'').replace(/[^0-9.]/g,''))||0) - (parseFloat((vb||'').replace(/[^0-9.]/g,''))||0); } else { c = va.localeCompare(vb, 'zh'); } return asc ? c : -c; }); rows.forEach(r => tbody.appendChild(r)); table.querySelectorAll('th[onclick]').forEach(h => h.dataset.asc = ''); th.dataset.asc = asc ? '1' : '0'; }
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape') { closeAllModals(); el('accountModal').style.display = 'none'; return; }
+      const t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === '/') { const s = document.querySelector('.list-search'); if (s) { e.preventDefault(); s.focus(); } return; }
+      if (e.key === 'g') { window.__gNext = true; setTimeout(() => window.__gNext = false, 1000); return; }
+      if (window.__gNext) { window.__gNext = false; const map = { w:'workers', d:'dns', k:'kv', i:'d1', m:'monitor', b:'bulk', s:'settings', p:'pages-manager', n:'snippets' }; const pg = map[e.key.toLowerCase()]; if (pg) navTo(pg); }
+    });
+    (function initApp(){
+      updateAcctBadge();
+      if (localStorage.getItem('mycf_dark') === '1') { document.body.classList.add('dark'); const t = el('darkToggle'); if (t) t.textContent = '浅色'; }
+      if (!getActiveCreds().email) {
+        window.__kvRestorePromise = fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ action:'load-accounts-kv' }) })
+          .then(r => r.json()).then(d => {
+            if (d.success && d.accounts && d.accounts.length) {
+              const local = loadSaved(); const merged = d.accounts.slice(); local.forEach(a => { if (!merged.find(x => x.email === a.email)) merged.push(a); });
+              localStorage.setItem('cf_accounts', JSON.stringify(merged));
+              localStorage.setItem('cf_active_email', merged[0].email); localStorage.setItem('cf_active_key', merged[0].key);
+              updateAcctBadge(); showNotification('已从 KV 恢复 ' + merged.length + ' 个账号');
+            }
+          }).catch(()=>{});
+      }
+    })();
 
     function renderBatchPage() {
         const arr = loadSaved(); const list = el('batchAccountList'); list.innerHTML = '';
@@ -2545,8 +2669,8 @@ function renderStaticJS(env) {
     // ==================== 自动解析 + 自定义脚本 ====================
     function parseScriptDeps(scriptContent, workerName) {
       var kvB=[], d1B=[], envV=[], seen={}, m;
-      var reKv=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:get|put|delete|list|getWithMetadata)[ \t]*[(]','g');
-      var reD1=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:prepare|exec|batch|dump)[ \t]*[(]','g');
+      var reKv=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:get|put|delete|list|getWithMetadata)[ \\t]*[(]','g');
+      var reD1=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)[.](?:prepare|exec|batch|dump)[ \\t]*[(]','g');
       var reAll=new RegExp('env[.]([A-Za-z][A-Za-z0-9_]*)','g');
       var kvSet={}, d1Set={};
       while((m=reKv.exec(scriptContent))!==null) kvSet[m[1]]=true;
@@ -3023,8 +3147,9 @@ async function refreshPagesManager(){
   }catch(e){box.innerHTML='<div class="small" style="color:#ef4444">读取失败：'+escapeHtml(e.message||String(e))+'</div>';}
 }
 async function deletePagesProject(name,domain){
-  if(!confirm('确定删除 Pages 项目「'+name+'」吗？删除全部部署且不可恢复。默认域名：'+domain))return;
-  try{const ar=await api('list-accounts');const accountId=ar&&ar.result&&ar.result[0]&&ar.result[0].id;if(!accountId)throw new Error((ar&&ar.error)||'无法获取当前账号的 Account ID');localStorage.setItem('cfaccountId',accountId);const r=await api('delete-pages-project',{accountId:accountId,projectName:name});if(r&&r.success){showNotification('已删除：'+name);refreshPagesManager();}else showNotification((r&&r.error)||'删除失败','error');}catch(e){showNotification(e.message||String(e),'error');}
+  confirmDialog('确定删除 Pages 项目「'+name+'」？删除全部部署且不可恢复。\\n默认域名：'+domain, async () => {
+    try{const ar=await api('list-accounts');const accountId=ar&&ar.result&&ar.result[0]&&ar.result[0].id;if(!accountId)throw new Error((ar&&ar.error)||'无法获取当前账号的 Account ID');localStorage.setItem('cfaccountId',accountId);const r=await api('delete-pages-project',{accountId:accountId,projectName:name});if(r&&r.success){showNotification('已删除：'+name);refreshPagesManager();}else showNotification((r&&r.error)||'删除失败','error');}catch(e){showNotification(e.message||String(e),'error');}
+  });
 }
 window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deletePagesProject;
 
@@ -3146,13 +3271,13 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     function openAddDomainModal(scriptName) { currentWorkerForDomain = scriptName; el('newDomainInput').value = ''; el('addDomainModal').style.display = 'flex'; }
     function closeAddDomainModal() { el('addDomainModal').style.display = 'none'; currentWorkerForDomain = ''; }
     async function confirmAddDomain() { const hostname = el('newDomainInput').value.trim(); const scriptName = currentWorkerForDomain; if (!hostname) return showNotification('请输入域名', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('add-worker-domain', { accountId, scriptName, hostname }); if (res && res.success) { showNotification('域名绑定成功'); closeAddDomainModal(); refreshWorkers(); } else { showNotification(res.error || '绑定失败', 'error'); } }
-    async function deleteWorkerDomain(scriptName, domainId, hostname) { if (!confirm('确定要解除绑定域名 ' + hostname + ' 吗？')) return; const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-worker-domain', { accountId, scriptName, domainId, hostname }); if (res && res.success) { showNotification('域名解绑成功'); refreshWorkers(); } else { showNotification(res.error || '解绑失败', 'error'); } }
+    async function deleteWorkerDomain(scriptName, domainId, hostname) { confirmDialog('确定解除绑定域名 ' + hostname + '？', async () => { const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-worker-domain', { accountId, scriptName, domainId, hostname }); if (res && res.success) { showNotification('域名解绑成功'); refreshWorkers(); } else { showNotification(res.error || '解绑失败', 'error'); } }); }
 
     async function updateWorkerMetrics() { try { const usageRes = await api('get-usage-today', { accountId: localStorage.getItem('cf_accountId') }); if (usageRes && usageRes.success && usageRes.data) { const data = usageRes.data; const total = data.total || 0; const workers = data.workers || 0; const pages = data.pages || 0; const percentage = data.percentage || 0; el('metricCount').textContent = \`\${total.toLocaleString()} / 100,000\`; el('metricBar').style.width = \`\${percentage}%\`; el('workersRequests').textContent = workers.toLocaleString(); el('pagesRequests').textContent = pages.toLocaleString(); } else { el('metricCount').textContent = '0 / 100,000'; el('metricBar').style.width = '0%'; el('workersRequests').textContent = '0'; el('pagesRequests').textContent = '0'; } } catch (e) { console.error(e); } }
     async function editWorker(name){ const accounts = await api('list-accounts'); const accountId = accounts.result?.[0]?.id; const res = await api('get-worker-script', { accountId, scriptName: name }); if (res && res.rawScript !== undefined) { el('createName').value = name; el('createName').readOnly = true; const ta = el('createScript'); ta.value = ''; ta.style.minHeight = '60vh'; ta.style.maxHeight = '70vh'; ta.style.overflowY = 'auto'; ta.style.whiteSpace = 'pre'; ta.style.fontFamily = 'monospace'; ta.style.fontSize = '13px'; setTimeout(() => { ta.value = res.rawScript; ta.scrollTop = 0; window._createScriptSnapshot = res.rawScript; }, 0); el('createModal').style.display='flex'; } else { showNotification('获取 Worker 脚本失败', 'error'); debugOut(res); } }
     async function confirmCreate(){ const name = el('createName').value.trim(); const script = el('createScript').value; if (!name) return showNotification('请输入 Worker 名称', 'error'); const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('deploy-worker', { accountId, scriptName: name, scriptSource: script, metadataBindings: [] }); if (res && res.success) { showNotification(res.message || 'Worker 部署成功'); window._createScriptSnapshot = script; el('createModal').style.display='none'; setTimeout(refreshWorkers, 800); } else { showNotification(res.error || '部署失败', 'error'); debugOut(res); } }
-    function closeCreate(){ const current = el('createScript').value; const nameVal = el('createName').value; const isNew = !el('createName').readOnly; const hasChanged = current !== window._createScriptSnapshot || (isNew && nameVal.trim() !== ''); if (hasChanged) { if (!confirm('有未保存的更改，确定要关闭吗？')) return; } el('createModal').style.display='none'; }
-    async function deleteWorker(name){ if (!confirm('确定要删除 Worker: '+name+' 吗？')) return; const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('delete-worker', { accountId, scriptName: name }); if (res && res.success) { showNotification(res.message || 'Worker 删除成功'); setTimeout(refreshWorkers, 600); } else { showNotification(res.error || '删除失败', 'error'); debugOut(res); } }
+    function closeCreate(){ const current = el('createScript').value; const nameVal = el('createName').value; const isNew = !el('createName').readOnly; const hasChanged = current !== window._createScriptSnapshot || (isNew && nameVal.trim() !== ''); if (hasChanged) { confirmDialog('有未保存的更改，确定要关闭吗？', () => { el('createModal').style.display='none'; }); return; } el('createModal').style.display='none'; }
+    async function deleteWorker(name){ confirmDialog('确定要删除 Worker: '+name+' 吗？', async () => { const accountId = (await api('list-accounts')).result?.[0]?.id; const res = await api('delete-worker', { accountId, scriptName: name }); if (res && res.success) { showNotification(res.message || 'Worker 删除成功'); setTimeout(refreshWorkers, 600); } else { showNotification(res.error || '删除失败', 'error'); debugOut(res); } }); }
     
     let currentWorkerForEnv = '';
     async function loadEnvVars(scriptName) { currentWorkerForEnv = scriptName; const accountId = localStorage.getItem('cf_accountId'); const res = await api('get-worker-variables', { accountId, scriptName }); el('envRows').innerHTML = ''; if (res && res.result && res.result.vars) { res.result.vars.forEach(v => { let value = v.value || v.text || ''; if (v.type === 'json' || (value && value.startsWith('{') && value.endsWith('}'))) { try { value = JSON.stringify(JSON.parse(value), null, 2); } catch (e) {} } addEnvRow(v.name, v.type || 'plain_text', value); }); } else { addEnvRow(); } }
@@ -3162,30 +3287,30 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     
     async function refreshKVNamespaces() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('list-kv-namespaces', { accountId }); const namespaces = res.result || []; el('kvNamespacesList').innerHTML = ''; if (namespaces.length === 0) { el('kvNamespacesList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 KV 命名空间</div>'; return; } namespaces.forEach(ns => { const div = document.createElement('div'); div.className = 'kv-item'; div.innerHTML = \`<div style="flex:1"><div style="font-weight:600">\${ns.title || ns.id}</div><div class="small">ID: \${ns.id}</div></div><div class="btns"><button class="btn" data-id="\${ns.id}" data-act="view">查看键值</button><button class="btn danger" data-id="\${ns.id}" data-act="delete">删除</button></div>\`; el('kvNamespacesList').appendChild(div); }); Array.from(el('kvNamespacesList').querySelectorAll('.btn')).forEach(btn => { btn.addEventListener('click', function() { const namespaceId = this.dataset.id; const act = this.dataset.act; if (act === 'view') viewKVNamespace(namespaceId); if (act === 'delete') deleteKVNamespace(namespaceId); }); }); }
     async function viewKVNamespace(namespaceId) { const accountId = localStorage.getItem('cf_accountId'); const res = await api('list-kv-keys', { accountId, namespaceId }); if (res && res.result) { const keys = res.result; let content = '<h4>KV 键值列表</h4>'; if (keys.length === 0) { content += '<p>暂无键值对</p>'; } else { content += '<ul>'; keys.forEach(key => { content += \`<li>\${key.name}</li>\`; }); content += '</ul>'; } el('debugOut').innerHTML = content; el('outModal').style.display = 'flex'; } else { showNotification('获取键值列表失败', 'error'); } }
-    async function deleteKVNamespace(namespaceId) { if (!confirm('确定要删除此 KV 命名空间吗？此操作不可逆！')) return; const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-kv-namespace', { accountId, namespaceId }); if (res && res.success) { showNotification('KV 命名空间删除成功'); refreshKVNamespaces(); } else { showNotification(res.error || '删除失败', 'error'); } }
+    async function deleteKVNamespace(namespaceId) { confirmDialog('确定要删除此 KV 命名空间吗？此操作不可逆！', async () => { const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-kv-namespace', { accountId, namespaceId }); if (res && res.success) { showNotification('KV 命名空间删除成功'); refreshKVNamespaces(); } else { showNotification(res.error || '删除失败', 'error'); } }); }
     function closeCreateKVModal(){ el('createKVModal').style.display='none'; }
     async function confirmCreateKVNamespace() { const name = el('kvNamespaceName').value.trim(); if (!name) return showNotification('请输入命名空间名称', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('create-kv-namespace', { accountId, title: name }); if (res && res.result) { showNotification('KV 命名空间创建成功'); el('createKVModal').style.display = 'none'; refreshKVNamespaces(); } else { showNotification(res.error || '创建失败', 'error'); } }
     
     async function refreshD1Databases() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('list-d1', { accountId }); const databases = res.result || []; el('d1DatabasesList').innerHTML = ''; el('d1DatabaseSelect').innerHTML = '<option value="">- 选择数据库 -</option>'; if (databases.length === 0) { el('d1DatabasesList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 D1 数据库</div>'; return; } databases.forEach(db => { const div = document.createElement('div'); div.className = 'kv-item'; div.innerHTML = \`<div style="flex:1"><div style="font-weight:600">\${db.name || db.id}</div><div class="small">ID: \${db.uuid || db.id} | 版本: \${db.version || 'N/A'}</div></div><div class="btns"><button class="btn danger" data-id="\${db.uuid || db.id}" data-act="delete">删除</button></div>\`; el('d1DatabasesList').appendChild(div); const option = document.createElement('option'); option.value = db.uuid || db.id; option.textContent = \`\${db.name} (\${db.uuid || db.id})\`; el('d1DatabaseSelect').appendChild(option); }); Array.from(el('d1DatabasesList').querySelectorAll('.btn')).forEach(btn => { btn.addEventListener('click', function() { const databaseId = this.dataset.id; const act = this.dataset.act; if (act === 'delete') deleteD1Database(databaseId); }); }); }
-    async function deleteD1Database(databaseId) { if (!confirm('确定要删除此 D1 数据库吗？此操作不可逆！')) return; const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-d1-database', { accountId, databaseId }); if (res && res.success) { showNotification('D1 数据库删除成功'); refreshD1Databases(); } else { showNotification(res.error || '删除失败', 'error'); } }
+    async function deleteD1Database(databaseId) { confirmDialog('确定要删除此 D1 数据库吗？此操作不可逆！', async () => { const accountId = localStorage.getItem('cf_accountId'); const res = await api('delete-d1-database', { accountId, databaseId }); if (res && res.success) { showNotification('D1 数据库删除成功'); refreshD1Databases(); } else { showNotification(res.error || '删除失败', 'error'); } }); }
     function closeCreateD1Modal(){ el('createD1Modal').style.display='none'; }
     async function confirmCreateD1Database() { const name = el('d1DatabaseName').value.trim(); const location = el('d1Location').value; if (!name) return showNotification('请输入数据库名称', 'error'); const accountId = localStorage.getItem('cf_accountId'); const payload = { accountId, name }; if (location && location !== 'auto') { payload.primary_location_hint = location; } const res = await api('create-d1-database', payload); if (res && res.result) { showNotification('D1 数据库创建成功'); el('createD1Modal').style.display = 'none'; refreshD1Databases(); } else { showNotification(res.error || '创建失败', 'error'); } }
     async function executeD1Query() { const databaseId = el('d1DatabaseSelect').value; const query = el('d1Query').value.trim(); if (!databaseId || !query) return showNotification('请选择数据库并输入查询语句', 'error'); const accountId = localStorage.getItem('cf_accountId'); const res = await api('execute-d1-query', { accountId, databaseId, query }); if (res && res.result) { el('d1QueryResults').innerHTML = '<pre>' + JSON.stringify(res.result, null, 2) + '</pre>'; } else { showNotification(res.error || '查询失败', 'error'); } }
     function refreshD1Tables() { }
 
     let currentZoneId = null; let currentEditingRecord = null;
-    async function refreshZones() { const res = await api('list-zones'); const zones = res.result || []; el('zonesList').innerHTML = ''; if (zones.length === 0) { el('zonesList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无域名</div>'; return; } const table = document.createElement('table'); table.className = 'domain-list-table'; table.innerHTML = \`<thead><tr><th>域名</th><th style="width:100px">状态</th><th>区域 ID (Zone ID)</th><th style="width:120px;text-align:right">操作</th></tr></thead><tbody></tbody>\`; const tbody = table.querySelector('tbody'); zones.forEach(zone => { const row = document.createElement('tr'); let statusHtml = \`\`; if (zone.status === 'active') { statusHtml = '<span style="background:#f0fdf4;color:#166534;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">已激活</span>'; } else { statusHtml = '<span style="background:#fffbeb;color:#d97706;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">待处理</span>'; } let nsSection = ''; if (zone.status === 'pending' && zone.name_servers && zone.name_servers.length > 0) { nsSection = \`<div style="margin-top:8px;font-size:12px;color:#64748b">请设置 NS 为:</div><div style="display:flex;flex-wrap:wrap;gap:0;margin-top:4px">\`; zone.name_servers.forEach(ns => { nsSection += \`<div class="ns-pill">\${ns}<span class="ns-copy-icon" onclick="event.stopPropagation(); copyToClipboard('\${ns}', event)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></span></div>\`; }); nsSection += \`<button class="copy-btn" style="margin-left:4px;height:20px;padding:0 6px" onclick="event.stopPropagation(); copyToClipboard('\${zone.name_servers.join(', ')}', event)">复制全部</button></div>\`; } row.innerHTML = \`<td><div style="font-weight:600;font-size:14px">\${escapeHtml(zone.name)}</div><div style="font-size:11px;color:#64748b;margin-top:2px">计划: \${zone.plan?.name || 'Free'}</div>\${nsSection}</td><td>\${statusHtml}</td><td style="font-family:monospace;color:#64748b;font-size:11px">\${zone.id}</td><td><div class="domain-row-actions"><button class="trash-btn" style="color:#2563eb;border-color:#dbeafe;background:#eff6ff" title="管理 DNS" onclick="event.stopPropagation(); viewZoneDNS('\${zone.id}', '\${escapeHtml(zone.name)}')">管理 DNS</button><button class="trash-btn" title="删除域名" onclick="event.stopPropagation(); deleteZone('\${zone.id}')">删除</button></div></td>\`; tbody.appendChild(row); }); el('zonesList').appendChild(table); window.viewZoneDNS = viewZoneDNS; window.deleteZone = deleteZone; }
+    async function refreshZones() { const res = await api('list-zones'); const zones = res.result || []; el('zonesList').innerHTML = ''; if (zones.length === 0) { el('zonesList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无域名</div>'; return; } const table = document.createElement('table'); table.className = 'domain-list-table'; table.innerHTML = \`<thead><tr><th style="cursor:pointer;user-select:none" onclick="sortTable(this,0,'str')" title="点击排序">域名 <span class="sort-ind"></span></th><th style="width:100px;cursor:pointer;user-select:none" onclick="sortTable(this,1,'str')" title="点击排序">状态 <span class="sort-ind"></span></th><th style="cursor:pointer;user-select:none" onclick="sortTable(this,2,'str')" title="点击排序">区域 ID (Zone ID) <span class="sort-ind"></span></th><th style="width:120px;text-align:right">操作</th></tr></thead><tbody></tbody>\`; const tbody = table.querySelector('tbody'); zones.forEach(zone => { const row = document.createElement('tr'); let statusHtml = \`\`; if (zone.status === 'active') { statusHtml = '<span style="background:#f0fdf4;color:#166534;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">已激活</span>'; } else { statusHtml = '<span style="background:#fffbeb;color:#d97706;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600">待处理</span>'; } let nsSection = ''; if (zone.status === 'pending' && zone.name_servers && zone.name_servers.length > 0) { nsSection = \`<div style="margin-top:8px;font-size:12px;color:#64748b">请设置 NS 为:</div><div style="display:flex;flex-wrap:wrap;gap:0;margin-top:4px">\`; zone.name_servers.forEach(ns => { nsSection += \`<div class="ns-pill">\${ns}<span class="ns-copy-icon" onclick="event.stopPropagation(); copyToClipboard('\${ns}', event)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></span></div>\`; }); nsSection += \`<button class="copy-btn" style="margin-left:4px;height:20px;padding:0 6px" onclick="event.stopPropagation(); copyToClipboard('\${zone.name_servers.join(', ')}', event)">复制全部</button></div>\`; } row.innerHTML = \`<td><div style="font-weight:600;font-size:14px">\${escapeHtml(zone.name)}</div><div style="font-size:11px;color:#64748b;margin-top:2px">计划: \${zone.plan?.name || 'Free'}</div>\${nsSection}</td><td>\${statusHtml}</td><td style="font-family:monospace;color:#64748b;font-size:11px">\${zone.id}</td><td><div class="domain-row-actions"><button class="trash-btn" style="color:#2563eb;border-color:#dbeafe;background:#eff6ff" title="管理 DNS" onclick="event.stopPropagation(); viewZoneDNS('\${zone.id}', '\${escapeHtml(zone.name)}')">管理 DNS</button><button class="trash-btn" title="删除域名" onclick="event.stopPropagation(); deleteZone('\${zone.id}')">删除</button></div></td>\`; tbody.appendChild(row); }); el('zonesList').appendChild(table); window.viewZoneDNS = viewZoneDNS; window.deleteZone = deleteZone; }
     function showZonesList() { el('zonesList').style.display = 'block'; el('dnsRecordsSection').style.display = 'none'; currentZoneId = null; refreshZones(); }
     function viewZoneDNS(zoneId, zoneName) { currentZoneId = zoneId; el('zonesList').style.display = 'none'; el('dnsRecordsSection').style.display = 'block'; el('selectedZoneName').textContent = \`\${zoneName} - DNS 记录管理\`; el('selectedZoneInfo').textContent = \`管理 \${zoneName} 的 DNS 记录\`; refreshDNSRecords(zoneId); }
     function backToZones() { showZonesList(); }
-    async function refreshDNSRecords(zoneId) { const res = await api('list-dns-records', { zoneId }); const records = res.result || []; el('dnsRecordsList').innerHTML = ''; if (records.length === 0) { el('dnsRecordsList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 DNS 记录</div>'; return; } const table = document.createElement('table'); table.className = 'dns-table'; table.innerHTML = \`<thead><tr><th>类型</th><th>名称</th><th>内容</th><th>TTL</th><th>代理</th><th>操作</th></tr></thead><tbody></tbody>\`; const tbody = table.querySelector('tbody'); records.forEach(record => { const row = document.createElement('tr'); row.innerHTML = \`<td>\${record.type}</td><td>\${record.name}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${record.content}</td><td>\${record.ttl}</td><td>\${record.proxied ? '开启' : '关闭'}</td><td><button class="btn small" data-id="\${record.id}" data-act="edit">编辑</button><button class="btn small danger" data-id="\${record.id}" data-act="delete">删除</button></td>\`; tbody.appendChild(row); }); el('dnsRecordsList').appendChild(table); Array.from(el('dnsRecordsList').querySelectorAll('.btn')).forEach(btn => { btn.addEventListener('click', function() { const recordId = this.dataset.id; const act = this.dataset.act; if (act === 'edit') editDNSRecord(zoneId, recordId); if (act === 'delete') deleteDNSRecord(zoneId, recordId); }); }); }
+    async function refreshDNSRecords(zoneId) { const res = await api('list-dns-records', { zoneId }); const records = res.result || []; el('dnsRecordsList').innerHTML = ''; if (records.length === 0) { el('dnsRecordsList').innerHTML = '<div style="text-align:center;padding:20px;color:#6b7280">暂无 DNS 记录</div>'; return; } const table = document.createElement('table'); table.className = 'dns-table'; table.innerHTML = \`<thead><tr><th style="cursor:pointer;user-select:none" onclick="sortTable(this,0,'str')">类型 <span class="sort-ind"></span></th><th style="cursor:pointer;user-select:none" onclick="sortTable(this,1,'str')">名称 <span class="sort-ind"></span></th><th style="cursor:pointer;user-select:none" onclick="sortTable(this,2,'str')">内容 <span class="sort-ind"></span></th><th style="cursor:pointer;user-select:none" onclick="sortTable(this,3,'num')">TTL <span class="sort-ind"></span></th><th style="cursor:pointer;user-select:none" onclick="sortTable(this,4,'str')">代理 <span class="sort-ind"></span></th><th>操作</th></tr></thead><tbody></tbody>\`; const tbody = table.querySelector('tbody'); records.forEach(record => { const row = document.createElement('tr'); row.innerHTML = \`<td>\${record.type}</td><td>\${record.name}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${record.content}</td><td>\${record.ttl}</td><td>\${record.proxied ? '开启' : '关闭'}</td><td><button class="btn small" data-id="\${record.id}" data-act="edit">编辑</button><button class="btn small danger" data-id="\${record.id}" data-act="delete">删除</button></td>\`; tbody.appendChild(row); }); el('dnsRecordsList').appendChild(table); Array.from(el('dnsRecordsList').querySelectorAll('.btn')).forEach(btn => { btn.addEventListener('click', function() { const recordId = this.dataset.id; const act = this.dataset.act; if (act === 'edit') editDNSRecord(zoneId, recordId); if (act === 'delete') deleteDNSRecord(zoneId, recordId); }); }); }
     async function editDNSRecord(zoneId, recordId) { const res = await api('list-dns-records', { zoneId }); const record = res.result.find(r => r.id === recordId); if (record) { currentEditingRecord = record; el('editDnsRecordType').value = record.type; el('editDnsRecordName').value = record.name; el('editDnsRecordContent').value = record.content; el('editDnsRecordTTL').value = record.ttl; el('editDnsRecordProxied').checked = record.proxied; el('editDNSRecordModal').style.display = 'flex'; } }
     async function confirmEditDNSRecord() { const zoneId = currentZoneId; const recordId = currentEditingRecord.id; const type = el('editDnsRecordType').value; const name = el('editDnsRecordName').value.trim(); const content = el('editDnsRecordContent').value.trim(); const ttl = parseInt(el('editDnsRecordTTL').value); const proxied = el('editDnsRecordProxied').checked; if (!zoneId || !type || !name || !content) { return showNotification('请填写完整的 DNS 记录信息', 'error'); } const res = await api('update-dns-record', { zoneId, recordId, type, name, content, ttl, proxied }); if (res && res.result) { showNotification('DNS 记录更新成功'); el('editDNSRecordModal').style.display = 'none'; currentEditingRecord = null; refreshDNSRecords(zoneId); } else { showNotification(res.error || '更新失败', 'error'); } }
     function closeEditDNSRecordModal() { el('editDNSRecordModal').style.display = 'none'; currentEditingRecord = null; }
     async function confirmAddDNSRecord() { const zoneId = currentZoneId; const type = el('dnsRecordType').value; const name = el('dnsRecordName').value.trim(); const content = el('dnsRecordContent').value.trim(); const ttl = parseInt(el('dnsRecordTTL').value); const proxied = el('dnsRecordProxied').checked; if (!zoneId || !type || !name || !content) { return showNotification('请填写完整的 DNS 记录信息', 'error'); } const res = await api('create-dns-record', { zoneId, type, name, content, ttl, proxied }); if (res && res.result) { showNotification('DNS 记录添加成功'); el('addDNSRecordModal').style.display = 'none'; refreshDNSRecords(zoneId); } else { showNotification(res.error || '添加失败', 'error'); } }
     function closeAddDNSRecordModal() { el('addDNSRecordModal').style.display = 'none'; }
-    async function deleteDNSRecord(zoneId, recordId) { if (!confirm('确定要删除此 DNS 记录吗？')) return; const res = await api('delete-dns-record', { zoneId, recordId }); if (res && res.success) { showNotification('DNS 记录删除成功'); refreshDNSRecords(zoneId); } else { showNotification(res.error || '删除失败', 'error'); } }
-    async function deleteZone(zoneId) { if (!confirm('确定要删除此域名吗？此操作不可逆！')) return; const res = await api('delete-zone', { zoneId }); if (res && res.success) { showNotification('域名删除成功'); refreshZones(); } else { showNotification(res.error || '删除失败', 'error'); } }
+    async function deleteDNSRecord(zoneId, recordId) { confirmDialog('确定要删除此 DNS 记录吗？', async () => { const res = await api('delete-dns-record', { zoneId, recordId }); if (res && res.success) { showNotification('DNS 记录删除成功'); refreshDNSRecords(zoneId); } else { showNotification(res.error || '删除失败', 'error'); } }); }
+    async function deleteZone(zoneId) { confirmDialog('确定要删除此域名吗？此操作不可逆！', async () => { const res = await api('delete-zone', { zoneId }); if (res && res.success) { showNotification('域名删除成功'); refreshZones(); } else { showNotification(res.error || '删除失败', 'error'); } }); }
     function closeAddZoneModal() { el('addZoneModal').style.display = 'none'; }
     async function confirmAddZone() { const name = el('zoneName').value.trim(); if (!name) return showNotification('请输入域名', 'error'); const res = await api('create-zone', { name }); if (res && res.result) { showNotification('域名添加成功，请在域名注册商处修改 NS 记录'); el('addZoneModal').style.display = 'none'; refreshZones(); if (typeof refreshSnippetZones === 'function') refreshSnippetZones(); } else { showNotification(res.error || '添加失败', 'error'); } }
     async function loadSubdomainSettings() { const accountId = localStorage.getItem('cf_accountId'); if (!accountId) return; const res = await api('get-workers-subdomain', { accountId }); if (res && res.result) { const subdomain = res.result.subdomain; el('subdomainInput').value = subdomain || ''; } }
@@ -3215,12 +3340,12 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       const box = el('tgUsageBox'); box.textContent = '加载中...';
       const r = await api('get-all-usage', {});
       if(!r || !r.success){ box.textContent = (r&&r.error)||'获取失败'; return; }
-      let txt = '日期(UTC): ' + r.date + '\n';
+      let txt = '日期(UTC): ' + r.date + '\\n';
       for(const u of r.results){
         const m = maskEmailFront(u.email);
-        if(u.error){ txt += '\n[' + m + '] 失败: ' + u.error; continue; }
-        txt += '\n[' + m + (u.name ? ' ' + u.name : '') + '] ' + (u.total||0).toLocaleString() + ' / 100,000 (' + (u.percent||0).toFixed(1) + '%)  W:' + (u.workers||0) + ' P:' + (u.pages||0) + '\n';
-        (u.byScript||[]).slice(0,5).forEach(s=> txt += '   - ' + s.script + ': ' + (s.requests||0).toLocaleString() + '\n');
+        if(u.error){ txt += '\\n[' + m + '] 失败: ' + u.error; continue; }
+        txt += '\\n[' + m + (u.name ? ' ' + u.name : '') + '] ' + (u.total||0).toLocaleString() + ' / 100,000 (' + (u.percent||0).toFixed(1) + '%)  W:' + (u.workers||0) + ' P:' + (u.pages||0) + '\\n';
+        (u.byScript||[]).slice(0,5).forEach(s=> txt += '   - ' + s.script + ': ' + (s.requests||0).toLocaleString() + '\\n');
       }
       box.textContent = txt;
     }
@@ -3245,17 +3370,17 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
           el('trendPrediction').textContent = p ? ('预测: ' + p.trend + (p.daysToLimit!=null ? ('，日均增长 '+p.dailyGrowth + '，约 ' + p.daysToLimit + ' 天后接近上限 (' + p.eta + ')') : '，暂无需担心')) : '数据不足，无法预测';
         }
         const s = await api('get-storage-usage', {});
-        if(s && s.success){ el('storageBox').textContent = (s.data||[]).map(d=> d.error ? ('['+maskEmailFront(d.email)+'] 查询失败') : ('['+maskEmailFront(d.email)+(d.name?' '+d.name:'')+'] D1库:'+d.d1Count+' R2操作:'+(d.r2Ops||0).toLocaleString()+' KV操作:'+(d.kvOps||0).toLocaleString())).join('\n') || '无数据'; }
+        if(s && s.success){ el('storageBox').textContent = (s.data||[]).map(d=> d.error ? ('['+maskEmailFront(d.email)+'] 查询失败') : ('['+maskEmailFront(d.email)+(d.name?' '+d.name:'')+'] D1库:'+d.d1Count+' R2操作:'+(d.r2Ops||0).toLocaleString()+' KV操作:'+(d.kvOps||0).toLocaleString())).join('\\n') || '无数据'; }
         const a = await api('get-asset-audit', {});
-        if(a && a.success){ const snap = a.snapshot; if(!snap){ el('assetBox').textContent='暂无快照'; } else { const lines=[]; for(const e of Object.keys(snap.accounts||{})){ const c = snap.accounts[e]; if(!c.alive){ lines.push('✗ '+maskEmailFront(e)+' 失效: '+(c.error||'')); continue; } const accs = c.accounts||[]; const wsum = accs.reduce((t,x)=>t+(x.workers||[]).length,0); const zsum = accs.reduce((t,x)=>t+(x.zones||[]).length,0); lines.push('✓ '+maskEmailFront(e)+' 账号'+accs.length+' Workers'+wsum+' Zones'+zsum); } el('assetBox').textContent = lines.join('\n'); } }
+        if(a && a.success){ const snap = a.snapshot; if(!snap){ el('assetBox').textContent='暂无快照'; } else { const lines=[]; for(const e of Object.keys(snap.accounts||{})){ const c = snap.accounts[e]; if(!c.alive){ lines.push('✗ '+maskEmailFront(e)+' 失效: '+(c.error||'')); continue; } const accs = c.accounts||[]; const wsum = accs.reduce((t,x)=>t+(x.workers||[]).length,0); const zsum = accs.reduce((t,x)=>t+(x.zones||[]).length,0); lines.push('✓ '+maskEmailFront(e)+' 账号'+accs.length+' Workers'+wsum+' Zones'+zsum); } el('assetBox').textContent = lines.join('\\n'); } }
         const pr = await api('get-health-probe', {});
-        if(pr && pr.success){ el('probeBox').textContent = (pr.results||[]).map(r=> (r.ok?'✓':'✗')+' '+r.worker+' ['+r.account+'] '+(r.status<0?'超时':r.status)+' '+(r.ms||0)+'ms').join('\n') || '无数据'; }
+        if(pr && pr.success){ el('probeBox').textContent = (pr.results||[]).map(r=> (r.ok?'✓':'✗')+' '+r.worker+' ['+r.account+'] '+(r.status<0?'超时':r.status)+' '+(r.ms||0)+'ms').join('\\n') || '无数据'; }
         const ce = await api('get-cert-expiry', {});
-        if(ce && ce.success){ el('certBox').textContent = (ce.certs||[]).map(c=> '['+maskEmailFront(c.email)+'] '+c.zone+': '+(c.days!=null?c.days+' 天':'无证书')).join('\n') || '无数据'; }
+        if(ce && ce.success){ el('certBox').textContent = (ce.certs||[]).map(c=> '['+maskEmailFront(c.email)+'] '+c.zone+': '+(c.days!=null?c.days+' 天':'无证书')).join('\\n') || '无数据'; }
         const wf = await api('get-waf-status', {});
-        if(wf && wf.success){ el('wafBox').textContent = (wf.waf||[]).map(w=> '['+maskEmailFront(w.email)+'] '+w.zone+': 拦截 '+(w.blocked||0).toLocaleString()).join('\n') || '无数据'; }
+        if(wf && wf.success){ el('wafBox').textContent = (wf.waf||[]).map(w=> '['+maskEmailFront(w.email)+'] '+w.zone+': 拦截 '+(w.blocked||0).toLocaleString()).join('\\n') || '无数据'; }
         const al = await api('get-audit-log', {});
-        if(al && al.success){ el('auditBox').textContent = (al.log||[]).map(l=> l.ts+'  '+(l.action||'')+(l.count?(' x'+l.count):'')).join('\n') || '暂无审计日志'; }
+        if(al && al.success){ el('auditBox').textContent = (al.log||[]).map(l=> l.ts+'  '+(l.action||'')+(l.count?(' x'+l.count):'')).join('\\n') || '暂无审计日志'; }
       } catch(e){ showNotification('监控加载失败: '+e.message, 'error'); }
     }
     async function runMonitorNow(){
@@ -3289,7 +3414,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       log.textContent = '部署到 ' + targets.length + ' 个账号...';
       const r = await api('bulk-deploy', { scriptName:name, scriptSource:src, targets });
       if(!r || !r.success){ log.textContent = (r&&r.error)||'失败'; return; }
-      log.textContent = r.results.map(x=> (x.ok?'✓':'✗')+' '+x.accountId+': '+(x.message||'')).join('\n');
+      log.textContent = r.results.map(x=> (x.ok?'✓':'✗')+' '+x.accountId+': '+(x.message||'')).join('\\n');
       showNotification('批量部署完成');
     }
     async function bulkPurge(){
@@ -3298,7 +3423,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       if(!zoneIds.length){ showNotification('请勾选域名','error'); return; }
       log.textContent = '清缓存中...';
       const r = await api('bulk-purge', { zoneIds, email:c.email, key:c.key, everything:true });
-      log.textContent = r && r.success ? r.results.map(x=>(x.ok?'✓':'✗')+' '+x.zoneId+(x.message?(': '+x.message):'')).join('\n') : ((r&&r.error)||'失败');
+      log.textContent = r && r.success ? r.results.map(x=>(x.ok?'✓':'✗')+' '+x.zoneId+(x.message?(': '+x.message):'')).join('\\n') : ((r&&r.error)||'失败');
     }
     async function bulkDns(paused){
       const log = el('bulkDnsLog'); const c = getActiveCreds();
@@ -3306,7 +3431,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       if(!zoneIds.length){ showNotification('请勾选域名','error'); return; }
       log.textContent = (paused?'暂停':'开启')+'代理中...';
       const r = await api('bulk-dns', { zoneIds, email:c.email, key:c.key, paused });
-      log.textContent = r && r.success ? r.results.map(x=>(x.ok?'✓':'✗')+' '+x.zoneId).join('\n') : ((r&&r.error)||'失败');
+      log.textContent = r && r.success ? r.results.map(x=>(x.ok?'✓':'✗')+' '+x.zoneId).join('\\n') : ((r&&r.error)||'失败');
     }
     (async function loadTGOnSettings(){
       try { const r = await api('load-tg-config', {}); if(r && r.success && r.config){
@@ -3324,12 +3449,14 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     async function confirmBind(){ const type = currentBindType; const ref = el('bindSelect').value; const bindName = el('bindName').value.trim() || (type==='kv'?'MY_KV':'MY_DB'); const script = el('createName').value.trim(); if (!script) return showNotification('请选择 Worker 名称', 'error'); if (!ref) return showNotification('请选择要绑定的资源', 'error'); const accountId = localStorage.getItem('cf_accountId'); let currentScript; let currentBindings = []; try { const scriptRes = await api('get-worker-script', { accountId, scriptName: script }); if (scriptRes && scriptRes.rawScript) { currentScript = scriptRes.rawScript; const scriptInfoRes = await api('get-worker-variables', { accountId, scriptName: script }); if (scriptInfoRes && scriptInfoRes.result && scriptInfoRes.result.vars) { const fullScriptRes = await fetch(\`/api\`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: 'get-worker-script', email: getActiveCreds().email, key: getActiveCreds().key, accountId: accountId, scriptName: script }) }); const fullScriptData = await fullScriptRes.json(); if (fullScriptData && fullScriptData.rawScript) { try { const scriptJson = JSON.parse(fullScriptData.rawScript); if (scriptJson.result && scriptJson.result.bindings) { currentBindings = scriptJson.result.bindings; } } catch (e) { } } } } else { currentScript = DEFAULT_WORKER_SCRIPT; } } catch (error) { console.error('获取当前脚本失败:', error); currentScript = DEFAULT_WORKER_SCRIPT; } const newBinding = (type==='kv') ? { type:'kv_namespace', name:bindName, namespace_id:ref } : { type:'d1', name:bindName, id:ref }; const otherBindings = currentBindings.filter(b => { if (b.type === 'plain_text' || b.type === 'secret_text') return true; return !(b.type === newBinding.type && b.name === newBinding.name); }); const finalBindings = [...otherBindings, newBinding]; const res = await api('deploy-worker', { accountId, scriptName: script, scriptSource: currentScript, metadataBindings: finalBindings }); if (res && res.success) { showNotification('资源绑定成功'); el('bindModal').style.display='none'; setTimeout(refreshWorkers,800); } else { showNotification(res.error || '绑定失败', 'error'); debugOut(res); } }
 
     (async function init() {
-      const creds = getActiveCreds();
-      if (!creds.email || !creds.key) { 
-        location.href = '/login'; 
-        return; 
+      let creds = getActiveCreds();
+      if (!creds.email || !creds.key) {
+        // 等 KV 恢复完成再决定是否跳登录页，避免"KV 里有账号却被弹回登录页"
+        try { await (window.__kvRestorePromise || Promise.resolve()); } catch(e){}
+        creds = getActiveCreds();
+        if (!creds.email || !creds.key) { location.href = '/login'; return; }
       }
-      el('acctInfo').textContent = creds.email;
+      el('acctInfo').textContent = creds.email; updateAcctBadge();
       setTimeout(() => { try { refreshWorkers(); } catch(e) { console.log(e); } }, 300);
     })();
 
@@ -3337,6 +3464,8 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     window.logout = function() { localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); location.href = '/login'; };
     window.openAccountSwitcher = openAccountSwitcher; window.closeAccountSwitcher = closeAccountSwitcher;
     window.switchAccount = switchAccount; window.removeAccount = removeAccount;
+    window.filterRows = filterRows; window.sortTable = sortTable; window.restoreFromKV = restoreFromKV;
+    window.toggleDark = toggleDark; window.toggleSidebar = toggleSidebar;
     window.openCreateWorker = function(){ el('createName').value=''; el('createName').readOnly = false; el('createScript').value = DEFAULT_WORKER_SCRIPT; window._createScriptSnapshot = DEFAULT_WORKER_SCRIPT; el('createModal').style.display='flex'; };
     window.openEnvFor = function(name){ el('createName').value = name; el('envModal').style.display='flex'; loadEnvVars(name); };
     window.openBindFor = function(name){ el('createName').value = name; el('bindModal').style.display='flex'; refreshBindList(); };
@@ -3498,15 +3627,16 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     }
 
     async function deleteSnippet(name) {
-      if (!confirm('确定要删除 Snippet: ' + name + ' 吗？相关路由规则需要手动删除。')) return;
-      var res = await api('delete-snippet', { zoneId: currentSnippetZoneId, snippetName: name });
-      if (res && res.success) {
-        showNotification('Snippet 删除成功');
-        refreshSnippets();
-        refreshSnippetRules();
-      } else {
-        showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '删除失败', 'error');
-      }
+      confirmDialog('确定要删除 Snippet: ' + name + '？相关路由规则需要手动删除。', async () => {
+        var res = await api('delete-snippet', { zoneId: currentSnippetZoneId, snippetName: name });
+        if (res && res.success) {
+          showNotification('Snippet 删除成功');
+          refreshSnippets();
+          refreshSnippetRules();
+        } else {
+          showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '删除失败', 'error');
+        }
+      });
     }
 
     function addRuleCondition() {
@@ -3616,14 +3746,15 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     }
 
     async function deleteSnippetRule(ruleId, snippetName) {
-      if (!confirm('确定要删除此路由规则吗？(Snippet: ' + snippetName + ')')) return;
-      var res = await api('delete-snippet-rule', { zoneId: currentSnippetZoneId, ruleId: ruleId });
-      if (res && res.success) {
-        showNotification('路由规则删除成功');
-        refreshSnippetRules();
-      } else {
-        showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '删除失败', 'error');
-      }
+      confirmDialog('确定要删除此路由规则吗？(Snippet: ' + snippetName + ')', async () => {
+        var res = await api('delete-snippet-rule', { zoneId: currentSnippetZoneId, ruleId: ruleId });
+        if (res && res.success) {
+          showNotification('路由规则删除成功');
+          refreshSnippetRules();
+        } else {
+          showNotification((res && res.errors && res.errors[0] && res.errors[0].message) || (res && res.error) || '删除失败', 'error');
+        }
+      });
     }
 
     window.showSnippetsZonesList = showSnippetsZonesList;
@@ -3649,28 +3780,25 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     async function batchDeleteWorkers() {
       const checked = Array.from(document.querySelectorAll('.worker-cb:checked'));
       if (checked.length === 0) return showNotification('请至少选择一个要删除的 Worker', 'error');
-      if (!confirm('确定要删除选中的 ' + checked.length + ' 个 Worker 吗？此操作不可逆！')) return;
-      
-      const accountId = localStorage.getItem('cf_accountId');
-      let okCount = 0, failCount = 0;
-      showNotification('正在批量删除 ' + checked.length + ' 个 Worker...');
-      
-      const chunks = [];
-      for (let i = 0; i < checked.length; i += 10) {
-        chunks.push(checked.slice(i, i + 10));
-      }
-      
-      for (const chunk of chunks) {
-        await Promise.all(chunk.map(async (cb) => {
-          const name = cb.value;
-          const res = await api('delete-worker', { accountId, scriptName: name });
-          if (res && res.success) okCount++;
-          else failCount++;
-        }));
-      }
-      
-      showNotification('删除完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
-      if (typeof refreshWorkers === 'function') refreshWorkers();
+      confirmDialog('确定要删除选中的 ' + checked.length + ' 个 Worker 吗？此操作不可逆！', async () => {
+        const accountId = localStorage.getItem('cf_accountId');
+        let okCount = 0, failCount = 0;
+        showNotification('正在批量删除 ' + checked.length + ' 个 Worker...');
+        const chunks = [];
+        for (let i = 0; i < checked.length; i += 10) {
+          chunks.push(checked.slice(i, i + 10));
+        }
+        for (const chunk of chunks) {
+          await Promise.all(chunk.map(async (cb) => {
+            const name = cb.value;
+            const res = await api('delete-worker', { accountId, scriptName: name });
+            if (res && res.success) okCount++;
+            else failCount++;
+          }));
+        }
+        showNotification('删除完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
+        if (typeof refreshWorkers === 'function') refreshWorkers();
+      });
     }
     window.batchDeleteWorkers = batchDeleteWorkers;
 
@@ -3680,35 +3808,31 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
     async function batchDeletePages() {
       const checked = Array.from(document.querySelectorAll('.pages-cb:checked'));
       if (checked.length === 0) return showNotification('请至少选择一个要删除的 Pages 项目', 'error');
-      if (!confirm('确定要删除选中的 ' + checked.length + ' 个 Pages 项目吗？此操作不可逆！')) return;
-      
-      let okCount = 0, failCount = 0;
-      showNotification('正在批量删除 ' + checked.length + ' 个 Pages 项目...');
-      
-      const chunks = [];
-      for (let i = 0; i < checked.length; i += 10) {
-        chunks.push(checked.slice(i, i + 10));
-      }
-      
-      let accountId = localStorage.getItem('cf_accountId');
-      if(!accountId) {
-         const ar = await api('list-accounts');
-         accountId = ar && ar.result && ar.result[0] && ar.result[0].id;
-         if(accountId) localStorage.setItem('cfaccountId', accountId);
-      }
-      if(!accountId) return showNotification('无法获取 Account ID', 'error');
-      
-      for (const chunk of chunks) {
-        await Promise.all(chunk.map(async (cb) => {
-          const name = cb.value;
-          const res = await api('delete-pages-project', { accountId, projectName: name });
-          if (res && res.success) okCount++;
-          else failCount++;
-        }));
-      }
-      
-      showNotification('删除完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
-      if (typeof refreshPagesManager === 'function') refreshPagesManager();
+      confirmDialog('确定要删除选中的 ' + checked.length + ' 个 Pages 项目吗？此操作不可逆！', async () => {
+        let okCount = 0, failCount = 0;
+        showNotification('正在批量删除 ' + checked.length + ' 个 Pages 项目...');
+        const chunks = [];
+        for (let i = 0; i < checked.length; i += 10) {
+          chunks.push(checked.slice(i, i + 10));
+        }
+        let accountId = localStorage.getItem('cf_accountId');
+        if (!accountId) {
+          const ar = await api('list-accounts');
+          accountId = ar && ar.result && ar.result[0] && ar.result[0].id;
+          if (accountId) localStorage.setItem('cfaccountId', accountId);
+        }
+        if (!accountId) return showNotification('无法获取 Account ID', 'error');
+        for (const chunk of chunks) {
+          await Promise.all(chunk.map(async (cb) => {
+            const name = cb.value;
+            const res = await api('delete-pages-project', { accountId, projectName: name });
+            if (res && res.success) okCount++;
+            else failCount++;
+          }));
+        }
+        showNotification('删除完成：成功 ' + okCount + ' 个，失败 ' + failCount + ' 个');
+        if (typeof refreshPagesManager === 'function') refreshPagesManager();
+      });
     }
     window.batchDeletePages = batchDeletePages;
 
