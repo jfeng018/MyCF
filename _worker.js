@@ -1921,6 +1921,8 @@ async function checkTrafficAlerts(env){
   let snap = null; try { const r = await kvGet(env,'an_snap'); if(r) snap = JSON.parse(r); } catch(e){}
   if(!snap || !snap.data) return;
   let daily = {}; try { const r = await kvGet(env,'an_daily'); if(r) daily = JSON.parse(r)||{}; } catch(e){}
+  // 基线优先官方按日直读(httpRequests1dGroups 免费 365 天)，自采 an_daily 仅兜底
+  try { const r = await kvGet(env,'official_daily'); if(r){ const o = JSON.parse(r)||{}; if(o && o.data && Object.keys(o.data).length) daily = o.data; } } catch(e){}
   let sent = {}; try { const r = await kvGet(env,'al_traffic'); if(r) sent = JSON.parse(r)||{}; } catch(e){}
   const today = new Date().toISOString().slice(0,10);
   const dates = Object.keys(daily).sort().slice(-8, -1); // 不含今天的既往日
@@ -1962,13 +1964,28 @@ function buildQuotaAlert(u, tier){
   const etaStr = eta ? ('\n预计打满(UTC): ' + eta) : '';
   return '⚠️ 配额告警 [' + tier + '%]\n' + masked + ' 已用 ' + fmtNum(u.total) + ' / 100,000 (' + u.percent.toFixed(1) + '%)' + etaStr;
 }
+// 健康数据官方直读：证书/证书包与 WAF 拦截计数均来自官方 API，仅在 KV 缓存超过阈值时按官方现查刷新
+const HEALTH_REFRESH_MS = 6 * 3600 * 1000;
+async function ensureFreshCert(env){
+  try {
+    const r = await kvGet(env, 'cert_ts'); if (r && Date.now() - Number(r) < HEALTH_REFRESH_MS) return;
+    const certs = await checkCertExpiry(env); await kvPut(env, 'cert_expiry', certs); await kvPut(env, 'cert_ts', String(Date.now()));
+  } catch(e){}
+}
+async function ensureFreshWaf(env){
+  try {
+    const r = await kvGet(env, 'waf_ts'); if (r && Date.now() - Number(r) < HEALTH_REFRESH_MS) return;
+    const waf = await checkWaf(env); await kvPut(env, 'waf_status', waf); await kvPut(env, 'waf_ts', String(Date.now()));
+  } catch(e){}
+}
 async function pushDailyReport(env, force = false){
   const cfg = await getTGConfig(env);
   if(!cfg.enabled) return { ok:false, error:'推送未启用' };
   if(!force && !cfg.dailyReport) return { ok:false, error:'日报未启用（定时开关关闭）' };
   if(!(await notifReady(env))) return { ok:false, error:'未配置任何通知通道（TG/多通道其一即可）' };
-  const creds = await loadKVAccounts(env);
+  let creds = await loadKVAccounts(env);
   if(!creds.length) return { ok:false, error:'KV 中无账号' };
+  try { await updateAccountStatuses(env); creds = await loadKVAccounts(env); } catch(e){}
   const results = [];
   for(const c of creds){
     const label = c.email || c.name || '';
@@ -1976,6 +1993,9 @@ async function pushDailyReport(env, force = false){
     catch(e){ results.push({ email: label, error:String(e) }); }
   }
   const dateStr = new Date().toISOString().slice(0,10);
+  // 健康数据官方直读：证书/WAF 缓存超 6h 时按官方现查刷新后再进日报（状态已在上方 live 刷新）
+  await ensureFreshCert(env).catch(()=>{});
+  await ensureFreshWaf(env).catch(()=>{});
   // 收集健康/流量上下文（读 KV，不外发请求）
   const ctx = { snapData: {}, abnormal: [], certs: [], probes: [], waf: [], segments: (cfg && cfg.segments) || undefined };
   try { const r = await kvGet(env,'an_snap'); if(r){ const s = JSON.parse(r); ctx.snapData = (s && s.data) || {}; } } catch(e){}
@@ -2414,7 +2434,7 @@ async function runDailyMonitoring(env){
   let prev = null; try { const r = await kvGet(env,'asset_snapshot'); if(r) prev = JSON.parse(r); } catch(e){}
   if(prev && prev.accounts){ const changes = diffAssets(prev, cur); if(changes.length && cfg.enabled && cfg.alerts && await notifReady(env)) await sendTelegram(env, buildAssetAuditMsg(changes)); }
   await kvPut(env,'asset_snapshot', cur);
-  const certs = await checkCertExpiry(env); await kvPut(env,'cert_expiry', certs);
+  const certs = await checkCertExpiry(env); await kvPut(env,'cert_expiry', certs); await kvPut(env, 'cert_ts', String(Date.now()));
   if(cfg.enabled && cfg.alerts && await notifReady(env)){ const due = certs.filter(c=>c.days!==null && c.days<=7); if(due.length) await sendTelegram(env, buildCertMsg(due)); }
   await heartbeat(env);
 }
@@ -2428,7 +2448,7 @@ async function runProbeMonitoring(env){
   const down = cur.filter(p=>!p.ok && pmap[p.email+'|'+p.worker] && pmap[p.email+'|'+p.worker].ok);
   if(down.length && cfg.enabled && cfg.alerts && await notifReady(env)) await sendTelegram(env, buildProbeMsg(down));
   await kvPut(env,'health_probe', cur);
-  const waf = await checkWaf(env); await kvPut(env,'waf_status', waf);
+  const waf = await checkWaf(env); await kvPut(env,'waf_status', waf); await kvPut(env, 'waf_ts', String(Date.now()));
   if(cfg.enabled && cfg.alerts && await notifReady(env)){ const sp = waf.filter(w=>w.blocked>=50000); if(sp.length) await sendTelegram(env, buildWafMsg(sp)); }
   await checkQuotaAlerts(env);
   await storeAnalytics(env).catch(()=>{});
