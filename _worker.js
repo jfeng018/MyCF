@@ -1126,7 +1126,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
         try {
           const end = new Date(); const start = new Date(Date.now() - 24 * 3600 * 1000);
-          const q = `query Z($tag:String!,$st:Time!,$et:Time!){viewer{zones(filter:{zoneTag:$tag}){httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetimeHour}sum{requests bytes}uniq{uniques}}}}}`
+          const q = `query Z($tag:String!,$st:Time!,$et:Time!){viewer{zones(filter:{zoneTag:$tag}){httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetime}sum{requests bytes}uniq{uniques}}}}}`
           const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, cfHeaders(payload.email, payload.key)), body: JSON.stringify({ query: q, variables: { tag: zoneId, st: start.toISOString(), et: end.toISOString() } }) });
           const res = await g.json();
           const zone = res && res.data && res.data.viewer && res.data.viewer.zones && res.data.viewer.zones[0];
@@ -2130,31 +2130,19 @@ async function storeAnalytics(env){
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
       if(!accountId){ fail++; continue; }
       const zlist = await cfZonesOfAccount(email, key, accountId).catch(() => ({ tags: [], names: {} }));
-      const q = 'query($tag:String!,$st:Time!,$et:Time!){viewer{accounts(filter:{accountTag:$tag}){zones{zoneTag httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetimeHour}sum{requests bytes}uniq{uniques}} country:httpRequestsAdaptiveGroups(limit:80,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{clientCountryName}} status:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{edgeResponseStatus}} colo:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{coloCode}}}}}}';
-      const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId, st, et } }) });
-      const res = await g.json();
+      const zq = 'query($zid:String!,$st:Time!,$et:Time!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetime}sum{requests bytes}uniq{uniques}} country:httpRequestsAdaptiveGroups(limit:80,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{clientCountryName}} status:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{edgeResponseStatus}} colo:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{coloCode}}}}}}';
+      const zones = [];
       let _anErr = '';
-      if (res && res.errors && res.errors.length) { try { _anErr = String((res.errors[0] && res.errors[0].message) || 'GraphQL errors').slice(0, 140); } catch(e){} }
-      else if (!res || !res.data || !res.data.viewer || !res.data.viewer.accounts || !res.data.viewer.accounts[0]) _anErr = 'GraphQL 返回为空结构';
-      const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
-      let zones = (acc && acc.zones) || [];
-      if (!zones.length || _anErr.indexOf('too many zones') !== -1) {
-        // 官方 account->zones 一次查询有 zone 数限制 → 逐 zone zone-scoped 兜底
-        const zq = 'query($zid:String!,$st:Time!,$et:Time!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetimeHour}sum{requests bytes}uniq{uniques}} country:httpRequestsAdaptiveGroups(limit:80,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{clientCountryName}} status:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{edgeResponseStatus}} colo:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{coloCode}}}}}}';
-        const fall = [];
-        for (const zid of zlist.tags) {
-          try {
-            const fg = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:zq, variables:{ zid, st, et } }) });
-            const fj = await fg.json();
-            const fz = fj && fj.data && fj.data.viewer && fj.data.viewer.zones && fj.data.viewer.zones[0];
-            if (fz) fall.push({ name: zlist.names[fz.zoneTag] || fz.zoneTag || '', zoneTag: fz.zoneTag || zid, httpRequests1hGroups: fz.httpRequests1hGroups || [], country: fz.country || [], status: fz.status || [], colo: fz.colo || [] });
-          } catch(e){}
-        }
-        if (fall.length) { zones = fall; _anErr = ''; }
-        else if (!_anErr) _anErr = '未取到 zones(逐 zone 兜底为空)';
-      } else if (zones.length) {
-        zones = zones.map(z => Object.assign({}, z, { name: zlist.names[z.zoneTag] || z.name || z.zoneTag || '' }));
+      for (const zid of zlist.tags) {
+        try {
+          const fg = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:zq, variables:{ zid, st, et } }) });
+          const fj = await fg.json();
+          if (fj && fj.errors && fj.errors.length) { if (!_anErr) { try { _anErr = String((fj.errors[0] && fj.errors[0].message) || '').slice(0, 140); } catch(e){} } continue; }
+          const fz = fj && fj.data && fj.data.viewer && fj.data.viewer.zones && fj.data.viewer.zones[0];
+          if (fz) zones.push({ name: zlist.names[fz.zoneTag] || fz.zoneTag || '', zoneTag: fz.zoneTag || zid, httpRequests1hGroups: fz.httpRequests1hGroups || [], country: fz.country || [], status: fz.status || [], colo: fz.colo || [] });
+        } catch(e){}
       }
+      if (!zones.length && !_anErr) _anErr = '未取到 zones(逐 zone 查询为空)';
       const hourMap = {}; const cmap = {}, smap = {}, lmap = {}; let req = 0, bytes = 0, uniq = 0;
       const zonesAgg = [];
       for(const z of zones){
@@ -2162,7 +2150,7 @@ async function storeAnalytics(env){
         let zr = 0, zb = 0, zu = 0;
         for(const h of groups){
           zr += (h.sum && h.sum.requests) || 0; zb += (h.sum && h.sum.bytes) || 0; zu += (h.uniq && h.uniq.uniques) || 0;
-          const t = String(h.dimensions && h.dimensions.datetimeHour || '').slice(11, 13);
+          const t = String((h.dimensions && (h.dimensions.datetimeHour || h.dimensions.datetime)) || '').slice(11, 13);
           if(t) hourMap[t] = (hourMap[t] || 0) + ((h.sum && h.sum.requests) || 0);
         }
         req += zr; bytes += zb; uniq += zu;
@@ -2208,28 +2196,19 @@ async function storeOfficialAnalytics(env, days = 92){
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
       if(!accountId){ fail++; continue; }
       const zlist = await cfZonesOfAccount(email, key, accountId).catch(() => ({ tags: [], names: {} }));
-      const q = 'query($tag:String!){viewer{accounts(filter:{accountTag:$tag}){zones{zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:"' + ge + '",date_leq:"' + le + '"}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}}';
-      const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId } }) });
-      const res = await g.json();
+      const zq = 'query($zid:String!,$ge:Date!,$le:Date!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:$ge,date_leq:$le}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}';
+      const zones = [];
       let _anErr = '';
-      if (res && res.errors && res.errors.length) { try { _anErr = String((res.errors[0] && res.errors[0].message) || 'GraphQL errors').slice(0, 140); } catch(e){} }
-      else if (!res || !res.data || !res.data.viewer || !res.data.viewer.accounts || !res.data.viewer.accounts[0]) _anErr = 'GraphQL 返回为空结构';
-      const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
-      let zones = (acc && acc.zones) || [];
-      if (!zones.length || _anErr.indexOf('too many zones') !== -1) {
-        const zq = 'query($zid:String!,$ge:Date!,$le:Date!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:$ge,date_leq:$le}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}';
-        const fall = [];
-        for (const zid of zlist.tags) {
-          try {
-            const fg = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:zq, variables:{ zid, ge, le } }) });
-            const fj = await fg.json();
-            const fz = fj && fj.data && fj.data.viewer && fj.data.viewer.zones && fj.data.viewer.zones[0];
-            if (fz) fall.push({ zoneTag: fz.zoneTag || zid, httpRequests1dGroups: fz.httpRequests1dGroups || [] });
-          } catch(e){}
-        }
-        if (fall.length) { zones = fall; _anErr = ''; }
-        else if (!_anErr) _anErr = '未取到 zones(逐 zone 兜底为空)';
+      for (const zid of zlist.tags) {
+        try {
+          const fg = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:zq, variables:{ zid, ge, le } }) });
+          const fj = await fg.json();
+          if (fj && fj.errors && fj.errors.length) { if (!_anErr) { try { _anErr = String((fj.errors[0] && fj.errors[0].message) || '').slice(0, 140); } catch(e){} } continue; }
+          const fz = fj && fj.data && fj.data.viewer && fj.data.viewer.zones && fj.data.viewer.zones[0];
+          if (fz) zones.push({ zoneTag: fz.zoneTag || zid, httpRequests1dGroups: fz.httpRequests1dGroups || [] });
+        } catch(e){}
       }
+      if (!zones.length && !_anErr) _anErr = '未取到 zones(逐 zone 查询为空)';
       const dayMap = {};
       for(const z of zones){
         for(const d of (z.httpRequests1dGroups || [])){
@@ -5345,7 +5324,7 @@ function renderStaticJS(env) {
       if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '查询失败') + '</span>'; return; }
       const groups = r.groups || [];
       if (!groups.length) { box.innerHTML = '<span style="color:#94a3b8">近 24h 无请求数据</span>'; return; }
-      const pts = groups.map(g => ({ t: String(g.dimensions && g.dimensions.datetimeHour || '').slice(11, 16), req: (g.sum && g.sum.requests) || 0, bytes: (g.sum && g.sum.bytes) || 0 }));
+      const pts = groups.map(g => ({ t: String((g.dimensions && (g.dimensions.datetimeHour || g.dimensions.datetime)) || '').slice(11, 16), req: (g.sum && g.sum.requests) || 0, bytes: (g.sum && g.sum.bytes) || 0 }));
       const max = Math.max.apply(null, pts.map(p => p.req)) || 1;
       const total = pts.reduce((a, b) => a + b.req, 0);
       const bytes = pts.reduce((a, b) => a + b.bytes, 0);
