@@ -195,7 +195,11 @@ async function handleAPI(req, env) {
     'list-kv-keys','create-d1-database','delete-d1-database','execute-d1-query',
     'list-zones','create-zone','delete-zone','list-dns-records','create-dns-record','delete-dns-record',
     'update-dns-record','toggle-worker-domain','get-worker-analytics','get-usage-today',
-    'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct','list-snippets','get-snippet','deploy-snippet','delete-snippet','list-snippet-rules','add-snippet-rule','delete-snippet-rule'
+    'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct','list-snippets','get-snippet','deploy-snippet','delete-snippet','list-snippet-rules','add-snippet-rule','delete-snippet-rule',
+    // WAF 自定义规则 / 隧道 / 批量重定向
+    'list-waf-rules','create-waf-entrypoint','create-waf-rule','update-waf-rule','delete-waf-rule',
+    'list-tunnels','create-tunnel','get-tunnel-token','get-tunnel-connections','delete-tunnel',
+    'list-redirect-lists','create-redirect-list','delete-redirect-list','list-redirect-items','add-redirect-items','delete-redirect-item','get-redirect-rules','save-redirect-rules'
   ]);
 
   // 资源类 action 的 OAuth 会话解析：前端仅提交 oauthId，后端解密 token 注入为 Bearer（key=__oa_+token）
@@ -834,6 +838,159 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         const next = arr.filter(a => !(a && a.oauth && a.oauthId === oauthId));
         await persistAccountsEnc(env, next);
         return json({ success: true });
+      }
+
+      // ===== WAF 自定义规则（zone ruleset phase: http_request_firewall_custom）=====
+      case 'list-waf-rules': {
+        const zoneId = payload.zoneId;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const r = await cfGet(`/zones/${zoneId}/rulesets/phases/http_request_firewall_custom/entrypoint`, payload.email, payload.key);
+        if (!r.success || !r.result) {
+          if (r.status === 404) return json({ success: true, exists: false, rules: [] });
+          return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取 WAF 规则失败' });
+        }
+        return json({ success: true, exists: true, rulesetId: r.result.id, rules: r.result.rules || [] });
+      }
+      case 'create-waf-entrypoint': {
+        const zoneId = payload.zoneId; const rules = payload.rules || [];
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const r = await cfPost(`/zones/${zoneId}/rulesets`, payload.email, payload.key, { name: 'Custom Rules', kind: 'zone', phase: 'http_request_firewall_custom', description: 'MyCF WAF custom rules', rules });
+        return json(r.success ? { success: true, rulesetId: r.result && r.result.id, rules: (r.result && r.result.rules) || rules } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '创建 ruleset 失败' });
+      }
+      case 'create-waf-rule': {
+        const { zoneId, rulesetId, rule } = payload;
+        if (!zoneId || !rulesetId || !rule) return json({ success: false, error: 'zoneId/rulesetId/rule required' }, 400);
+        const r = await cfPost(`/zones/${zoneId}/rulesets/${rulesetId}/rules`, payload.email, payload.key, rule);
+        return json(r.success ? { success: true, rule: r.result } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '创建规则失败' });
+      }
+      case 'update-waf-rule': {
+        const { zoneId, rulesetId, ruleId, rule } = payload;
+        if (!zoneId || !rulesetId || !ruleId || !rule) return json({ success: false, error: 'zoneId/rulesetId/ruleId/rule required' }, 400);
+        const r = await cfAny('PATCH', `/zones/${zoneId}/rulesets/${rulesetId}/rules/${ruleId}`, payload.email, payload.key, rule);
+        return json(r.success ? { success: true, rule: r.result } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '更新规则失败' });
+      }
+      case 'delete-waf-rule': {
+        const { zoneId, rulesetId, ruleId } = payload;
+        if (!zoneId || !rulesetId || !ruleId) return json({ success: false, error: 'zoneId/rulesetId/ruleId required' }, 400);
+        const r = await cfAny('DELETE', `/zones/${zoneId}/rulesets/${rulesetId}/rules/${ruleId}`, payload.email, payload.key);
+        return json({ success: r.success, error: r.success ? undefined : ((r.errors && r.errors[0] && r.errors[0].message) || '删除失败') });
+      }
+
+      // ===== Cloudflare Tunnel（cfd_tunnel）=====
+      case 'list-tunnels': {
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfGet(`/accounts/${accountId}/cfd_tunnel?is_deleted=false`, payload.email, payload.key);
+        if (!r.success) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取隧道列表失败' });
+        return json({ success: true, tunnels: r.result || [], accountId });
+      }
+      case 'create-tunnel': {
+        const name = String(payload.name || '').trim();
+        if (!name) return json({ success: false, error: '隧道名称必填' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfPost(`/accounts/${accountId}/cfd_tunnel`, payload.email, payload.key, { name, config_src: 'cloudflare' });
+        if (!r.success) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '创建隧道失败' });
+        return json({ success: true, tunnel: r.result });
+      }
+      case 'get-tunnel-token': {
+        const { tunnelId } = payload;
+        if (!tunnelId) return json({ success: false, error: 'tunnelId required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfGet(`/accounts/${accountId}/cfd_tunnel/${tunnelId}/token`, payload.email, payload.key);
+        if (!r.success) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取 token 失败' });
+        return json({ success: true, token: r.result });
+      }
+      case 'get-tunnel-connections': {
+        const { tunnelId } = payload;
+        if (!tunnelId) return json({ success: false, error: 'tunnelId required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfGet(`/accounts/${accountId}/cfd_tunnel/${tunnelId}/connections`, payload.email, payload.key);
+        return json({ success: r.success, connections: (r.success && r.result) ? r.result : [], error: r.success ? undefined : ((r.errors && r.errors[0] && r.errors[0].message) || '获取连接失败') });
+      }
+      case 'delete-tunnel': {
+        const { tunnelId } = payload;
+        if (!tunnelId) return json({ success: false, error: 'tunnelId required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfAny('DELETE', `/accounts/${accountId}/cfd_tunnel/${tunnelId}`, payload.email, payload.key);
+        return json({ success: r.success, error: r.success ? undefined : ((r.errors && r.errors[0] && r.errors[0].message) || '删除隧道失败') });
+      }
+
+      // ===== 批量重定向 Bulk Redirects（redirect lists + http_request_redirect ruleset）=====
+      case 'list-redirect-lists': {
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfGet(`/accounts/${accountId}/rules/lists?per_page=1000`, payload.email, payload.key);
+        if (!r.success) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取列表失败' });
+        const lists = (r.result || []).filter(l => l && l.kind === 'redirect');
+        return json({ success: true, lists, accountId });
+      }
+      case 'create-redirect-list': {
+        const name = String(payload.name || '').trim();
+        if (!name) return json({ success: false, error: '列表名称必填' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfPost(`/accounts/${accountId}/rules/lists`, payload.email, payload.key, { name, kind: 'redirect', description: payload.description || '' });
+        return json(r.success ? { success: true, list: r.result } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '创建列表失败' });
+      }
+      case 'delete-redirect-list': {
+        const { listId } = payload;
+        if (!listId) return json({ success: false, error: 'listId required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfAny('DELETE', `/accounts/${accountId}/rules/lists/${listId}`, payload.email, payload.key);
+        return json({ success: r.success, error: r.success ? undefined : ((r.errors && r.errors[0] && r.errors[0].message) || '删除列表失败') });
+      }
+      case 'list-redirect-items': {
+        const { listId } = payload;
+        if (!listId) return json({ success: false, error: 'listId required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfGet(`/accounts/${accountId}/rules/lists/${listId}/items?per_page=1000`, payload.email, payload.key);
+        if (!r.success) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取条目失败' });
+        return json({ success: true, items: r.result || [] });
+      }
+      case 'add-redirect-items': {
+        const { listId, items } = payload;
+        if (!listId || !Array.isArray(items) || !items.length) return json({ success: false, error: 'listId + items[] required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfPost(`/accounts/${accountId}/rules/lists/${listId}/items`, payload.email, payload.key, items);
+        if (!r.success) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '添加条目失败' });
+        const opId = r.result && r.result.operation_id;
+        if (opId) {
+          for (let i = 0; i < 12; i++) {
+            await new Promise(res => setTimeout(res, 500));
+            try {
+              const s = await cfGet(`/accounts/${accountId}/rules/lists/bulk_operations/${opId}`, payload.email, payload.key);
+              if (s && s.result && s.result.status === 'completed') break;
+              if (s && s.result && s.result.status === 'failed') return json({ success: false, error: '批量添加失败：' + ((s.result.error && s.result.error.message) || s.result.status) });
+            } catch(e){ break; }
+          }
+        }
+        return json({ success: true });
+      }
+      case 'delete-redirect-item': {
+        const { listId, itemId } = payload;
+        if (!listId || !itemId) return json({ success: false, error: 'listId & itemId required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfAny('DELETE', `/accounts/${accountId}/rules/lists/${listId}/items/${itemId}`, payload.email, payload.key);
+        return json({ success: r.success, error: r.success ? undefined : ((r.errors && r.errors[0] && r.errors[0].message) || '删除条目失败') });
+      }
+      case 'get-redirect-rules': {
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfGet(`/accounts/${accountId}/rulesets/phases/http_request_redirect/entrypoint`, payload.email, payload.key);
+        if (!r.success || !r.result) {
+          if (r.status === 404) return json({ success: true, exists: false, rules: [] });
+          return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取重定向规则失败' });
+        }
+        return json({ success: true, exists: true, rulesetId: r.result.id, rules: r.result.rules || [] });
+      }
+      case 'save-redirect-rules': {
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const rules = payload.rules || [];
+        // 先探测 entrypoint 是否存在；不存在则用 POST 创建 root ruleset
+        const probe = await cfGet(`/accounts/${accountId}/rulesets/phases/http_request_redirect/entrypoint`, payload.email, payload.key);
+        let r;
+        if (probe && probe.success && probe.result) {
+          r = await cfAny('PUT', `/accounts/${accountId}/rulesets/phases/http_request_redirect/entrypoint`, payload.email, payload.key, { rules });
+        } else {
+          r = await cfPost(`/accounts/${accountId}/rulesets`, payload.email, payload.key, { name: 'Bulk Redirects', kind: 'root', phase: 'http_request_redirect', description: 'MyCF bulk redirects', rules });
+        }
+        return json(r.success ? { success: true, rules: (r.result && r.result.rules) || rules } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '保存重定向规则失败' });
       }
 
       case 'save-tg-config': {
@@ -2227,6 +2384,9 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
       <div class="item" data-page="kv" onclick="navTo('kv')">Workers KV</div>
       <div class="item" data-page="d1" onclick="navTo('d1')">D1 数据库</div>
       <div class="item" data-page="dns" onclick="navTo('dns')">域名管理</div>
+      <div class="item" data-page="waf" onclick="navTo('waf')">WAF 规则</div>
+      <div class="item" data-page="tunnels" onclick="navTo('tunnels')">隧道 Tunnel</div>
+      <div class="item" data-page="redirects" onclick="navTo('redirects')">批量重定向</div>
       <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div>
       <div class="item" data-page="pages" onclick="navTo('pages')">批量部署 Pages</div>
       <div class="item" data-page="bulk" onclick="navTo('bulk')">批量操作</div>
@@ -2784,6 +2944,47 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
     </div>
 
     <!-- Bulk Page -->
+    <!-- WAF Page（资源 · 需执行账号） -->
+    <div id="waf-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">WAF 自定义规则</div>
+        <button class="btn primary" onclick="openWafRuleModal()">新建规则</button>
+      </div>
+      <div class="small" style="margin:4px 0 12px">基于 Ruleset 引擎的 zone 级 custom rules（同 dash → Security → WAF → Custom rules）。需要执行账号有对应 zone 权限。</div>
+      <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="wafZoneSel" class="input" style="flex:1;min-width:220px" onchange="loadWafRules()"></select>
+        <button class="btn" onclick="loadWafRules()">刷新</button>
+      </div>
+      <div id="wafBox" class="small" style="white-space:pre-wrap;font-family:monospace">选择域名后加载…</div>
+      <div id="wafRuleList"></div>
+    </div>
+
+    <!-- Tunnels Page（资源 · 需执行账号） -->
+    <div id="tunnels-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">Cloudflare Tunnel 隧道</div>
+        <button class="btn primary" onclick="openTunnelModal()">新建隧道</button>
+      </div>
+      <div class="small" style="margin:4px 0 12px">远程托管隧道（config_src=cloudflare）：创建后复制 token，在任一主机执行 <code>cloudflared service install &lt;token&gt;</code> 即建立连接。</div>
+      <div id="tunnelList" class="small" style="font-family:monospace">加载中…</div>
+    </div>
+
+    <!-- Redirects Page（资源 · 需执行账号） -->
+    <div id="redirects-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">批量重定向 Bulk Redirects</div>
+        <div style="display:flex;gap:8px">
+          <button class="btn primary" onclick="openRedirectListModal()">新建列表</button>
+        </div>
+      </div>
+      <div class="small" style="margin:4px 0 12px">结构：redirect 列表(存条目) + 「启用列表」规则(account ruleset phase http_request_redirect)。需先建列表→添加重定向→添加启用规则。被重定向的域名须经 Cloudflare 代理。</div>
+      <div id="redirectListBox" class="small" style="font-family:monospace">加载中…</div>
+      <div style="margin-top:16px">
+        <h3 style="margin:0 0 8px">启用列表的规则</h3>
+        <div id="redirectRulesBox" class="small" style="font-family:monospace">加载中…</div>
+      </div>
+    </div>
+
     <div id="bulk-page" class="page-content">
       <div class="header"><div style="font-size:20px;font-weight:700">批量操作</div></div>
       <div class="grid">
@@ -2811,6 +3012,91 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
     </div>
 
 <!-- Modals -->
+<div id="wafRuleModal" class="modal"><div class="modal-box">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 id="wafRuleModalTitle" style="margin:0">新建 WAF 规则</h3>
+    <button class="trash-btn" onclick="closeModal('wafRuleModal')">✕</button>
+  </div>
+  <div class="small" style="margin-bottom:4px">表达式（目标域名的流量需经 Cloudflare 代理）</div>
+  <textarea id="wafExpr" class="input" style="min-height:64px;font-family:monospace" placeholder='(ip.geoip.country eq "CN") and http.request.uri.path contains "/admin"'></textarea>
+  <div style="margin:6px 0;display:flex;gap:6px;flex-wrap:wrap">
+    <button class="btn small" onclick="wafExprPlus('ip.geoip.country eq ')">国家=</button>
+    <button class="btn small" onclick="wafExprPlus('(http.host eq \&quot;example.com\&quot;)')">域名=</button>
+    <button class="btn small" onclick="wafExprPlus('http.request.uri.path contains ')">路径含</button>
+    <button class="btn small" onclick="wafExprPlus(' and ')">AND</button>
+    <button class="btn small" onclick="wafExprPlus(' or ')">OR</button>
+    <button class="btn small" onclick="wafExprPlus(' not ')">NOT</button>
+  </div>
+  <div class="small" style="margin-bottom:6px">动作</div>
+  <select id="wafAction" class="input">
+    <option value="block">Block 阻止(403)</option>
+    <option value="challenge">Challenge 验证码(旧)</option>
+    <option value="js_challenge">JS Challenge</option>
+    <option value="managed_challenge">Managed Challenge 托管验证</option>
+    <option value="log">Log 仅记录</option>
+    <option value="allow">Allow 放行</option>
+  </select>
+  <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+    <input id="wafDesc" class="input" style="flex:2;min-width:200px" placeholder="描述（可选）">
+    <label style="display:flex;align-items:center;gap:6px;flex:0 0 auto;color:#475569"><input id="wafEnabled" type="checkbox" checked> 启用</label>
+  </div>
+  <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn" onclick="closeModal('wafRuleModal')">取消</button>
+    <button class="btn primary" onclick="saveWafRule()">保存规则</button>
+  </div>
+</div></div>
+
+<div id="tunnelModal" class="modal"><div class="modal-box">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 style="margin:0">新建隧道</h3>
+    <button class="trash-btn" onclick="closeModal('tunnelModal')">✕</button>
+  </div>
+  <input id="tunnelName" class="input" placeholder="隧道名称（如 home-nas）">
+  <div class="small" style="margin:6px 0">创建为远程托管隧道，随后在列表中点「令牌命令」获取 cloudflared 安装命令。</div>
+  <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn" onclick="closeModal('tunnelModal')">取消</button>
+    <button class="btn primary" onclick="createTunnel()">创建</button>
+  </div>
+</div></div>
+
+<div id="redirectListModal" class="modal"><div class="modal-box">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 style="margin:0">新建重定向列表</h3>
+    <button class="trash-btn" onclick="closeModal('redirectListModal')">✕</button>
+  </div>
+  <input id="rlName" class="input" placeholder="列表名称（如 my_redirect_list）">
+  <input id="rlDesc" class="input" style="margin-top:8px" placeholder="描述（可选）">
+  <div class="small" style="margin:6px 0">创建后请向列表添加条目（源|目标|状态码），再用「启用列表」规则激活。</div>
+  <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn" onclick="closeModal('redirectListModal')">取消</button>
+    <button class="btn primary" onclick="createRedirectList()">创建</button>
+  </div>
+</div></div>
+
+<div id="redirectItemsModal" class="modal"><div class="modal-box" style="max-width:720px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <h3 id="rlItemsTitle" style="margin:0">列表条目</h3>
+    <button class="trash-btn" onclick="closeModal('redirectItemsModal')">✕</button>
+  </div>
+  <div class="small" style="margin-bottom:6px">批量添加，每行一条：<code>源|目标|状态码(可选)</code>，如 <code>example.com/blog/|https://example.com/blog/latest|301</code></div>
+  <textarea id="rlItemsInput" class="input" style="min-height:84px;font-family:monospace" placeholder="example.com/blog/|https://example.com/blog/latest&#10;example.net/|https://example.net/new|307"></textarea>
+  <div style="margin:6px 0"><button class="btn primary small" onclick="addRedirectItems()">批量添加</button></div>
+  <div id="rlItemsList" class="small" style="max-height:300px;overflow:auto"></div>
+</div></div>
+
+<div id="redirectEnableModal" class="modal"><div class="modal-box">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 style="margin:0">启用列表（添加重定向规则）</h3>
+    <button class="trash-btn" onclick="closeModal('redirectEnableModal')">✕</button>
+  </div>
+  <select id="reListSel" class="input"></select>
+  <div class="small" style="margin:6px 0">规则表达式固定为 <code>http.request.full_uri in $列表名</code>，按 full_uri 精确匹配列表条目源地址。</div>
+  <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn" onclick="closeModal('redirectEnableModal')">取消</button>
+    <button class="btn primary" onclick="enableRedirectList()">启用</button>
+  </div>
+</div></div>
+
 <div id="accountModal" class="modal"><div class="modal-box small">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
      <h3 style="margin:0">切换账号</h3>
@@ -3318,7 +3604,7 @@ function renderStaticJS(env) {
     function goAccounts(){ closeAccountSwitcher(); navTo('accounts'); }
 
     // 两级结构：资源页需要"执行账号"，未选择时先引导（不再影响全局页）
-    const RESOURCE_PAGES = ['workers','pages-manager','snippets','kv','d1','dns','batch','pages','bulk'];
+    const RESOURCE_PAGES = ['workers','pages-manager','snippets','kv','d1','dns','waf','tunnels','redirects','batch','pages','bulk'];
     function ensureAccount(){
       const a = getActiveCreds();
       if (a.oauthId || (a.email && a.key)) return true;
@@ -3343,6 +3629,7 @@ function renderStaticJS(env) {
         case 'kv': refreshKVNamespaces(); break;
         case 'd1': refreshD1Databases(); break;
         case 'dns': showZonesList(); break; case 'snippets': showSnippetsZonesList(); break;
+        case 'waf': loadWafPage(); break; case 'tunnels': loadTunnelsPage(); break; case 'redirects': loadRedirectsPage(); break;
         case 'monitor': loadMonitor(); break; case 'bulk': renderBulkAccounts(); renderBulkZones(); break;
         case 'settings': loadSettingsAll(); break;
       }
@@ -3482,6 +3769,320 @@ function renderStaticJS(env) {
       } } catch(e){}
       try { const r = await api('load-notify-config', {}); if (r && r.success && r.config) { fillNotifyConfig(r.config); } } catch(e){}
     }
+
+    // ===== 管理面三件套：WAF / Tunnel / Bulk Redirects =====
+    const ctx3 = { waf:null, tunnels:[], redirLists:[], redirRules:[] };
+    function closeModal(id){ const m = el(id); if (m) m.style.display = 'none'; }
+    function escAttr(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+    function statusChip(status){
+      const map = { healthy:['#0f6e56','在线'], degraded:['#854F0B','降级'], inactive:['#64748b','未运行'], down:['#a32d2d','离线'], disabled:['#94a3b8','停用'] };
+      const m = map[status] || ['#475569', status || '未知'];
+      return '<span style="color:' + m[0] + ';font-weight:700">● ' + m[1] + '</span>';
+    }
+
+    // ---------- WAF 自定义规则 ----------
+    async function loadWafPage(){
+      try {
+        const sel = el('wafZoneSel');
+        const r = await api('list-zones', {});
+        if (r && r.success && Array.isArray(r.result) && r.result.length) {
+          sel.innerHTML = r.result.map(z => '<option value="' + escAttr(z.id) + '">' + escAttr(z.name) + '</option>').join('');
+          const saved = localStorage.getItem('waf_zone');
+          sel.value = (saved && r.result.find(z => z.id === saved)) ? saved : r.result[0].id;
+          localStorage.setItem('waf_zone', sel.value);
+        } else {
+          sel.innerHTML = '<option value="">无可用域名</option>';
+        }
+      } catch(e){}
+      loadWafRules();
+    }
+    async function loadWafRules(){
+      const box = el('wafRuleList'); const zoneId = el('wafZoneSel').value;
+      if (!zoneId) { box.innerHTML = '<div style="color:#94a3b8;padding:8px">请先选择域名</div>'; return; }
+      localStorage.setItem('waf_zone', zoneId);
+      box.innerHTML = '<div style="color:#94a3b8;padding:8px">加载中…</div>';
+      const r = await api('list-waf-rules', { zoneId });
+      if (!r || !r.success) { box.innerHTML = '<div style="color:#b91c1c;padding:8px">' + escAttr((r && r.error) || '加载失败') + '</div>'; return; }
+      ctx3.waf = { zoneId, exists: r.exists, rulesetId: r.rulesetId || '', rules: r.rules || [] };
+      renderWafRules();
+    }
+    function renderWafRules(){
+      const box = el('wafRuleList'); const ctx = ctx3.waf;
+      if (!ctx) return;
+      if (!ctx.rules.length) { box.innerHTML = '<div style="color:#94a3b8;padding:8px">暂无自定义规则 —— 点击右上「新建规则」</div>'; return; }
+      const rows = ctx.rules.map((rule, i) => {
+        const act = String(rule.action || '').toUpperCase();
+        const color = { BLOCK:'#a32d2d', CHALLENGE:'#854F0B', JS_CHALLENGE:'#854F0B', MANAGED_CHALLENGE:'#3730a3', LOG:'#64748b', ALLOW:'#0f6e56' }[act] || '#475569';
+        const on = rule.enabled !== false;
+        return '<div class="worker-row" style="padding:10px;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px">' +
+          '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">' +
+          '<div style="flex:1;min-width:220px">' +
+          '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="color:#94a3b8;font-size:12px">#' + (i + 1) + '</span><span style="font-weight:700;color:' + color + '">' + act + '</span>' + (on ? '<span style="font-size:11px;color:#0f6e56">启用</span>' : '<span style="font-size:11px;color:#94a3b8">停用</span>') + (rule.description ? '<span style="font-size:11px;color:#64748b">' + escAttr(rule.description) + '</span>' : '') + '</div>' +
+          '<div style="font-family:monospace;font-size:12px;color:#334155;margin-top:4px;word-break:break-all">' + escAttr(rule.expression) + '</div>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+          '<label class="switch" style="margin:0" title="启停"><input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleWafRule(' + i + ', this.checked)"><span class="slider"></span></label>' +
+          '<button class="btn small" onclick="editWafRule(' + i + ')">编辑</button>' +
+          '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="deleteWafRule(' + i + ')">删除</button>' +
+          '</div></div></div>';
+      }).join('');
+      box.innerHTML = rows;
+    }
+    function wafExprPlus(t){ const t1 = el('wafExpr'); t1.value = (t1.value ? t1.value + ' ' : '') + t; t1.focus(); }
+    function openWafRuleModal(editIdx){
+      ctx3.wafEditIdx = (editIdx == null ? null : editIdx);
+      el('wafRuleModalTitle').textContent = editIdx == null ? '新建 WAF 规则' : '编辑 WAF 规则';
+      if (editIdx != null && ctx3.waf && ctx3.waf.rules[editIdx]) {
+        const rule = ctx3.waf.rules[editIdx];
+        el('wafExpr').value = rule.expression || '';
+        el('wafAction').value = rule.action || 'block';
+        el('wafDesc').value = rule.description || '';
+        el('wafEnabled').checked = rule.enabled !== false;
+      } else {
+        el('wafExpr').value = ''; el('wafAction').value = 'block'; el('wafDesc').value = ''; el('wafEnabled').checked = true;
+      }
+      el('wafRuleModal').style.display = 'flex';
+    }
+    function editWafRule(i){ openWafRuleModal(i); }
+    async function saveWafRule(){
+      const expression = el('wafExpr').value.trim();
+      if (!expression) return showNotification('请填写表达式', 'error');
+      const rule = { expression, action: el('wafAction').value, description: el('wafDesc').value.trim(), enabled: el('wafEnabled').checked };
+      const ctx = ctx3.waf; if (!ctx) return;
+      const idx = ctx3.wafEditIdx;
+      try {
+        if (idx != null && ctx.rules[idx] && ctx.rules[idx].id) {
+          const r = await api('update-waf-rule', { zoneId: ctx.zoneId, rulesetId: ctx.rulesetId, ruleId: ctx.rules[idx].id, rule });
+          if (!r || !r.success) return showNotification((r && r.error) || '更新失败', 'error');
+        } else if (!ctx.exists) {
+          const r = await api('create-waf-entrypoint', { zoneId: ctx.zoneId, rules: [rule] });
+          if (!r || !r.success) return showNotification((r && r.error) || '创建失败', 'error');
+          ctx.exists = true; ctx.rulesetId = r.rulesetId;
+        } else {
+          const r = await api('create-waf-rule', { zoneId: ctx.zoneId, rulesetId: ctx.rulesetId, rule });
+          if (!r || !r.success) return showNotification((r && r.error) || '创建失败', 'error');
+        }
+        closeModal('wafRuleModal'); showNotification('已保存'); loadWafRules();
+      } catch(e){ showNotification('保存异常：' + e.message, 'error'); }
+    }
+    async function toggleWafRule(i, on){
+      const ctx = ctx3.waf; if (!ctx || !ctx.rules[i]) return;
+      const rule = ctx.rules[i];
+      const r = await api('update-waf-rule', { zoneId: ctx.zoneId, rulesetId: ctx.rulesetId, ruleId: rule.id, rule: { enabled: on } });
+      if (!r || !r.success) { showNotification((r && r.error) || '操作失败', 'error'); renderWafRules(); return; }
+      ctx.rules[i].enabled = on; renderWafRules();
+    }
+    function deleteWafRule(i){
+      const ctx = ctx3.waf; const rule = ctx.rules[i];
+      if (!rule) return;
+      confirmDialog('删除该 WAF 规则？\\n' + String(rule.description || rule.expression).slice(0, 80), async () => {
+        const r = await api('delete-waf-rule', { zoneId: ctx.zoneId, rulesetId: ctx.rulesetId, ruleId: rule.id });
+        if (!r || !r.success) return showNotification((r && r.error) || '删除失败', 'error');
+        showNotification('已删除'); loadWafRules();
+      });
+    }
+
+    // ---------- Cloudflare Tunnel ----------
+    async function loadTunnelsPage(){
+      const box = el('tunnelList'); box.innerHTML = '<div style="color:#94a3b8">加载中…</div>';
+      const r = await api('list-tunnels', {});
+      if (!r || !r.success) { box.innerHTML = '<div style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</div>'; return; }
+      ctx3.tunnels = r.tunnels || [];
+      if (!ctx3.tunnels.length) { box.innerHTML = '<div style="color:#94a3b8">暂无隧道 —— 点击右上「新建隧道」</div>'; return; }
+      const rows = ctx3.tunnels.map(t => {
+        const on = t.status === 'healthy' || t.status === 'degraded';
+        return '<div class="worker-row" style="padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">' +
+          '<div style="flex:1;min-width:200px"><div style="font-weight:700">' + escAttr(t.name) + '</div>' +
+          '<div style="font-size:12px;color:#94a3b8">' + String(t.id || '').slice(0, 12) + '… · ' + (on ? statusChip(t.status) : statusChip('inactive')) + ' · 创建于 ' + escAttr(String(t.created_at || '').slice(0, 10)) + '</div></div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+          '<button class="btn small" onclick="showTunnelCmd(\\'' + t.id + '\\', \\'' + escAttr(t.name) + '\\')">令牌命令</button>' +
+          '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="deleteTunnel(\\'' + t.id + '\\', \\'' + escAttr(t.name) + '\\')">删除</button>' +
+          '</div></div></div>';
+      }).join('');
+      box.innerHTML = rows;
+    }
+    function openTunnelModal(){ el('tunnelName').value = ''; el('tunnelModal').style.display = 'flex'; }
+    async function createTunnel(){
+      const name = el('tunnelName').value.trim();
+      if (!name) return showNotification('请输入隧道名称', 'error');
+      const r = await api('create-tunnel', { name });
+      if (!r || !r.success) return showNotification((r && r.error) || '创建失败', 'error');
+      closeModal('tunnelModal'); showNotification('隧道已创建：' + name); loadTunnelsPage();
+    }
+    async function showTunnelCmd(id, name){
+      const r = await api('get-tunnel-token', { tunnelId: id });
+      if (!r || !r.success) return showNotification((r && r.error) || '获取 token 失败', 'error');
+      const token = r.token;
+      const cmd1 = 'cloudflared service install ' + token;
+      const cmd2 = 'cloudflared tunnel run --token ' + token;
+      const wrap = document.createElement('div');
+      wrap.innerHTML = '<div class="small" style="white-space:pre-wrap;font-family:monospace;background:#f1f5f9;padding:10px;border-radius:8px;max-height:180px;overflow:auto">' +
+        '<b style="color:#334155">' + escAttr(name) + '</b>\\n' + escAttr(cmd1) + '\\n\\n# 或\\n' + escAttr(cmd2) + '</div>';
+      // 放入 accountModal 容器复用？不：用 confirmDialog 无复制。创建临时预览
+      showCmdOverlay(cmd1, name);
+    }
+    function showCmdOverlay(cmd, name){
+      let ov = el('cmdOverlay');
+      if (!ov) {
+        ov = document.createElement('div'); ov.id = 'cmdOverlay'; ov.className = 'modal'; ov.style.cssText = 'display:none';
+        ov.innerHTML = '<div class="modal-box" style="max-width:640px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><h3 style="margin:0">cloudflared 安装命令</h3><button class="trash-btn" onclick="closeCmdOverlay()">✕</button></div>' +
+          '<div class="small" style="margin-bottom:8px">在任一台能访问内网的机器上执行（首次会提示以服务运行）。点击复制后粘贴到终端。</div>' +
+          '<div id="cmdText" style="font-family:monospace;font-size:12px;background:#0f172a;color:#a5f3fc;padding:12px;border-radius:8px;word-break:break-all;white-space:pre-wrap"></div>' +
+          '<div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end"><button class="btn primary" onclick="copyCmd()">复制命令</button></div></div>';
+        document.body.appendChild(ov);
+      }
+      ov.style.display = 'flex';
+      ov.querySelector('#cmdText').textContent = cmd;
+      document.getElementById('cmdOverlay').dataset.name = name || '';
+    }
+    function copyCmd(){ const ov = el('cmdOverlay'); copyToClipboard(ov.querySelector('#cmdText').textContent); }
+    function closeCmdOverlay(){ el('cmdOverlay').style.display = 'none'; }
+    function deleteTunnel(id, name){
+      confirmDialog('删除隧道「' + name + '」？\\n若已配置公网域名请先到 DNS 移除对应 CNAME（<id>.cfargotunnel.com），否则需在 Cloudflare 侧清理。', async () => {
+        const r = await api('delete-tunnel', { tunnelId: id });
+        if (!r || !r.success) return showNotification((r && r.error) || '删除失败', 'error');
+        showNotification('已删除'); loadTunnelsPage();
+      });
+    }
+
+    // ---------- Bulk Redirects ----------
+    async function loadRedirectsPage(){ await Promise.all([loadRedirectLists(), loadRedirectRules()]); }
+    async function loadRedirectLists(){
+      const box = el('redirectListBox');
+      const r = await api('list-redirect-lists', {});
+      if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</span>'; return; }
+      ctx3.redirLists = r.lists || [];
+      if (!ctx3.redirLists.length) { box.innerHTML = '<span style="color:#94a3b8">暂无 redirect 列表 —— 点「新建列表」</span>'; return; }
+      box.innerHTML = '<div style="display:flex;flex-direction:column;gap:8px">' + ctx3.redirLists.map(l =>
+        '<div class="worker-row" style="padding:10px;border:1px solid #e2e8f0;border-radius:10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">' +
+        '<div style="flex:1;min-width:180px"><b>' + escAttr(l.name) + '</b> <span style="color:#94a3b8">' + (l.num_items || 0) + ' 条</span>' + (l.description ? ' <span style="font-size:12px;color:#64748b">' + escAttr(l.description) + '</span>' : '') + '</div>' +
+        '<div style="display:flex;gap:6px">' +
+        '<button class="btn small" onclick="viewRedirectItems(\\'' + l.id + '\\', \\'' + escAttr(l.name) + '\\')">条目</button>' +
+        '<button class="btn small" onclick="enableRedirectListFrom(\\'' + l.id + '\\', \\'' + escAttr(l.name) + '\\')">启用此列表</button>' +
+        '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="deleteRedirectList(\\'' + l.id + '\\', \\'' + escAttr(l.name) + '\\')">删除</button>' +
+        '</div></div>').join('') + '</div>';
+    }
+    async function loadRedirectRules(){
+      const box = el('redirectRulesBox');
+      const r = await api('get-redirect-rules', {});
+      if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</span>'; return; }
+      ctx3.redirRules = { exists: r.exists, rulesetId: r.rulesetId || '', rules: r.rules || [] };
+      const rs = ctx3.redirRules.rules;
+      const head = '<div style="display:flex;gap:8px;margin-bottom:8px"><button class="btn small" onclick="openRedirectEnable()">添加启用规则</button></div>';
+      if (!rs.length) { box.innerHTML = head + '<span style="color:#94a3b8">未启用任何列表（建好列表并添加条目后，点「添加启用规则」生效）</span>'; return; }
+      box.innerHTML = head + rs.map((rule, i) => {
+        const on = rule.enabled !== false;
+        const listName = (rule.action_parameters && rule.action_parameters.from_list && rule.action_parameters.from_list.name) || '';
+        return '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px;margin-bottom:8px">' +
+          '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">' +
+          '<div style="flex:1;min-width:180px"><b style="font-size:13px">' + escAttr(listName) + '</b> ' + (on ? '<span style="color:#0f6e56;font-size:12px">启用</span>' : '<span style="color:#94a3b8;font-size:12px">停用</span>') +
+          '<div style="font-family:monospace;font-size:11px;color:#64748b;word-break:break-all">' + escAttr(rule.expression) + '</div></div>' +
+          '<div style="display:flex;gap:6px;align-items:center"><label class="switch" style="margin:0"><input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleRedirectRule(' + i + ', this.checked)"><span class="slider"></span></label>' +
+          '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="removeRedirectRule(' + i + ')">删除</button></div></div></div>';
+      }).join('');
+    }
+    function openRedirectListModal(){ el('rlName').value = ''; el('rlDesc').value = ''; el('redirectListModal').style.display = 'flex'; }
+    async function createRedirectList(){
+      const name = el('rlName').value.trim();
+      if (!name) return showNotification('请输入列表名称', 'error');
+      const r = await api('create-redirect-list', { name, description: el('rlDesc').value.trim() });
+      if (!r || !r.success) return showNotification((r && r.error) || '创建失败', 'error');
+      closeModal('redirectListModal'); showNotification('列表已创建'); loadRedirectLists();
+    }
+    function deleteRedirectList(id, name){
+      confirmDialog('删除重定向列表「' + name + '」？已引用该列表的规则将失效。', async () => {
+        const r = await api('delete-redirect-list', { listId: id });
+        if (!r || !r.success) return showNotification((r && r.error) || '删除失败', 'error');
+        showNotification('已删除'); loadRedirectsPage();
+      });
+    }
+    function viewRedirectItems(id, name){
+      el('rlItemsTitle').textContent = '列表条目：' + name;
+      el('rlItemsInput').value = '';
+      ctx3.itemsCtx = { listId: id, name };
+      el('redirectItemsModal').style.display = 'flex';
+      refreshRedirectItems();
+    }
+    async function refreshRedirectItems(){
+      const box = el('rlItemsList'); const c = ctx3.itemsCtx; if (!c) return;
+      box.innerHTML = '<span style="color:#94a3b8">加载中…</span>';
+      const r = await api('list-redirect-items', { listId: c.listId });
+      if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</span>'; return; }
+      const items = r.items || [];
+      if (!items.length) { box.innerHTML = '<span style="color:#94a3b8">（空）在上方按行添加条目</span>'; return; }
+      box.innerHTML = items.map(it => {
+        const rd = (it.redirect || {});
+        return '<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;border-bottom:1px dashed #e2e8f0;padding:6px 0;flex-wrap:wrap">' +
+          '<div style="flex:1;min-width:200px;font-size:12px"><div><b style="color:#b91c1c">' + escAttr(rd.source_url) + '</b> → <b style="color:#0f6e56">' + escAttr(rd.target_url) + '</b>' + (rd.status_code ? ' <span style="color:#475569">[' + rd.status_code + ']</span>' : '') + '</div>' +
+          (rd.include_subdomains || rd.subpath_matching || rd.preserve_query_string ? '<div style="color:#94a3b8">' + (rd.include_subdomains ? '含子域 ' : '') + (rd.subpath_matching ? '子路径匹配 ' : '') + (rd.preserve_query_string ? '保留查询串' : '') + '</div>' : '') + '</div>' +
+          '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="deleteRedirectItem(\\'' + it.id + '\\')">删除</button></div>';
+      }).join('');
+    }
+    async function addRedirectItems(){
+      const c = ctx3.itemsCtx; if (!c) return;
+      const raw = el('rlItemsInput').value || '';
+      const items = [];
+      raw.split('\\n').forEach(line => {
+        line = line.trim(); if (!line) return;
+        const p = line.split('|');
+        if (p.length < 2) return;
+        const redirect = { source_url: p[0].trim(), target_url: p[1].trim() };
+        const code = parseInt(p[2], 10);
+        if (code === 301 || code === 302 || code === 307 || code === 308) redirect.status_code = code;
+        items.push({ redirect });
+      });
+      if (!items.length) return showNotification('未解析到有效条目（源|目标|状态码）', 'error');
+      const r = await api('add-redirect-items', { listId: c.listId, items });
+      if (!r || !r.success) return showNotification((r && r.error) || '添加失败', 'error');
+      el('rlItemsInput').value = '';
+      showNotification('已提交 ' + items.length + ' 条'); refreshRedirectItems();
+    }
+    async function deleteRedirectItem(itemId){
+      const c = ctx3.itemsCtx; if (!c || !itemId) return;
+      const r = await api('delete-redirect-item', { listId: c.listId, itemId });
+      if (!r || !r.success) return showNotification((r && r.error) || '删除失败', 'error');
+      showNotification('已删除'); refreshRedirectItems();
+    }
+    function openRedirectEnable(){
+      if (!ctx3.redirLists.length) { showNotification('请先创建 redirect 列表', 'error'); return; }
+      el('reListSel').innerHTML = ctx3.redirLists.map(l => '<option value="' + escAttr(l.name) + '">' + escAttr(l.name) + ' (' + (l.num_items || 0) + ' 条)</option>').join('');
+      el('redirectEnableModal').style.display = 'flex';
+    }
+    function enableRedirectListFrom(id, name){ openRedirectEnable(); el('reListSel').value = name; }
+    async function enableRedirectList(){
+      const listName = el('reListSel').value; if (!listName) return;
+      const rr = ctx3.redirRules;
+      const dup = rr && rr.rules.find(x => x.action === 'redirect' && x.action_parameters && x.action_parameters.from_list && x.action_parameters.from_list.name === listName);
+      if (dup) { closeModal('redirectEnableModal'); showNotification('该列表已在启用规则中', 'error'); return; }
+      const rule = { expression: 'http.request.full_uri in $' + listName, description: 'Bulk Redirect: ' + listName, action: 'redirect', action_parameters: { from_list: { name: listName, key: 'http.request.full_uri' } }, enabled: true };
+      const r = await api('save-redirect-rules', { rules: [rule] });
+      if (!r || !r.success) return showNotification((r && r.error) || '启用失败', 'error');
+      closeModal('redirectEnableModal'); showNotification('已启用'); loadRedirectRules();
+    }
+    async function toggleRedirectRule(i, on){
+      const rr = ctx3.redirRules; if (!rr || !rr.rules[i]) return;
+      const rules = rr.rules.map((x, j) => j === i ? Object.assign({}, x, { enabled: on }) : x);
+      const r = await api('save-redirect-rules', { rules });
+      if (!r || !r.success) { showNotification((r && r.error) || '操作失败', 'error'); loadRedirectRules(); return; }
+      loadRedirectRules();
+    }
+    function removeRedirectRule(i){
+      const rr = ctx3.redirRules; if (!rr) return;
+      const rule = rr.rules[i]; if (!rule) return;
+      const listName = (rule.action_parameters && rule.action_parameters.from_list && rule.action_parameters.from_list.name) || '';
+      confirmDialog('移除对该列表的引用（不删除列表本身）？\\n' + listName, async () => {
+        const rules = rr.rules.filter((x, j) => j !== i);
+        const r = await api('save-redirect-rules', { rules });
+        if (!r || !r.success) return showNotification((r && r.error) || '失败', 'error');
+        showNotification('已移除'); loadRedirectRules();
+      });
+    }
+    window.closeModal = closeModal;
+    window.wafExprPlus = wafExprPlus; window.openWafRuleModal = openWafRuleModal; window.saveWafRule = saveWafRule; window.toggleWafRule = toggleWafRule; window.editWafRule = editWafRule; window.deleteWafRule = deleteWafRule;
+    window.openTunnelModal = openTunnelModal; window.createTunnel = createTunnel; window.showTunnelCmd = showTunnelCmd; window.deleteTunnel = deleteTunnel; window.copyCmd = copyCmd; window.closeCmdOverlay = closeCmdOverlay;
+    window.openRedirectListModal = openRedirectListModal; window.createRedirectList = createRedirectList; window.deleteRedirectList = deleteRedirectList; window.viewRedirectItems = viewRedirectItems; window.addRedirectItems = addRedirectItems; window.deleteRedirectItem = deleteRedirectItem;
+    window.openRedirectEnable = openRedirectEnable; window.enableRedirectList = enableRedirectList; window.enableRedirectListFrom = enableRedirectListFrom; window.toggleRedirectRule = toggleRedirectRule; window.removeRedirectRule = removeRedirectRule;
 
     // ===== OAuth 免密钥接入（设置页）=====
     async function loadOAuthUI(){
