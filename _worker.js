@@ -1192,6 +1192,23 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       }
 
       // ================= 监控中心 actions（走 KV 凭据，免登录校验） =================
+      case 'get-dashboard': {
+        const out = { snap: null, daily: {}, usage: {}, accounts: [] };
+        try { const r = await kvGet(env, 'an_snap'); if (r) out.snap = JSON.parse(r); } catch(e){}
+        try { const r = await kvGet(env, 'an_daily'); if (r) out.daily = JSON.parse(r) || {}; } catch(e){}
+        try { const r = await kvGet(env, 'usage_history'); if (r) out.usage = JSON.parse(r) || {}; } catch(e){}
+        try {
+          const accs = await loadKVAccounts(env);
+          out.accounts = accs.map(a => ({ email: a.email || '', name: a.name || '', oauth: !!a.oauth, oauthId: a.oauthId || '', status: a.status || 'ok', group: a.group || '' }));
+        } catch(e){}
+        return json({ success: true, dash: out });
+      }
+      case 'collect-analytics-now': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
+        const r = await storeAnalytics(env);
+        return json({ success: true, ok: r.ok, fail: r.fail });
+      }
+
       case 'get-usage-trend': {
         let history = {}; try { const r = await kvGet(env,'usage_history'); if(r) history = JSON.parse(r)||{}; } catch(e){}
         const credsN = (await loadKVAccounts(env)).length;
@@ -1799,6 +1816,57 @@ async function storeDailySnapshots(env){
   const keys = Object.keys(history).sort(); while(keys.length > 60) delete history[keys.shift()];
   await kvPut(env,'usage_history', history);
 }
+
+// ---- 账号 HTTP 分析采集（请求/带宽/访问者，GraphQL zones 24h；写入 an_snap + an_daily）----
+async function storeAnalytics(env){
+  const creds = await loadKVAccounts(env);
+  if(!creds.length) return { ok:0, fail:0 };
+  const now = new Date();
+  const st = new Date(now.getTime() - 24*3600*1000).toISOString();
+  const et = now.toISOString();
+  const date = et.slice(0,10);
+  const out = {}; let ok = 0, fail = 0;
+  for(const c of creds){
+    try {
+      const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
+      const key = c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key;
+      if(!key){ fail++; continue; }
+      const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
+      if(!accountId){ fail++; continue; }
+      const q = 'query($tag:String!,$st:Time!,$et:Time!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetimeHour}sum{requests bytes}uniq{uniques}}}}}}';
+      const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId, st, et } }) });
+      const res = await g.json();
+      const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
+      const zones = (acc && acc.zones) || [];
+      const hourMap = {}; let req = 0, bytes = 0, uniq = 0;
+      const zonesAgg = [];
+      for(const z of zones){
+        const groups = z.httpRequests1hGroups || [];
+        let zr = 0, zb = 0, zu = 0;
+        for(const h of groups){
+          zr += (h.sum && h.sum.requests) || 0; zb += (h.sum && h.sum.bytes) || 0; zu += (h.uniq && h.uniq.uniques) || 0;
+          const t = String(h.dimensions && h.dimensions.datetimeHour || '').slice(11, 13);
+          if(t) hourMap[t] = (hourMap[t] || 0) + ((h.sum && h.sum.requests) || 0);
+        }
+        req += zr; bytes += zb; uniq += zu;
+        zonesAgg.push({ name: z.name || z.zoneTag || '', zoneTag: z.zoneTag || '', req: zr, bytes: zb, uniq: zu });
+      }
+      zonesAgg.sort((a, b) => b.req - a.req);
+      const points = Object.keys(hourMap).sort().map(h => ({ t: h + ':00', req: hourMap[h] }));
+      out[email] = { email, accountId, name: c.name || '', zones: zonesAgg, req, bytes, uniq, points };
+      ok++;
+    } catch(e){ fail++; }
+  }
+  await kvPut(env, 'an_snap', { ts: et, data: out });
+  let daily = {}; try { const r = await kvGet(env, 'an_daily'); if(r) daily = JSON.parse(r) || {}; } catch(e){}
+  const day = daily[date] || {};
+  for(const k of Object.keys(out)) day[k] = { email: out[k].email, accountId: out[k].accountId, name: out[k].name, req: out[k].req, bytes: out[k].bytes, uniq: out[k].uniq };
+  daily[date] = day;
+  const dkeys = Object.keys(daily).sort(); while(dkeys.length > 60) delete daily[dkeys.shift()];
+  await kvPut(env, 'an_daily', daily);
+  return { ok, fail };
+}
+
 function computeUsageTrend(history, days){
   const dates = Object.keys(history||{}).sort().slice(-days);
   return dates.map(d => ({ date:d, total:(history[d]||[]).reduce((t,r)=>t+(r.total||0),0) }));
@@ -2075,6 +2143,7 @@ async function runDailyMonitoring(env){
   if(newly.length && await notifReady(env)) await sendTelegram(env, buildAbnormalMsg(newly));
   const cfg = await getTGConfig(env);
   await storeDailySnapshots(env);
+  await storeAnalytics(env).catch(()=>{});
   await storeStorageUsage(env);
   const cur = await snapshotAssets(env);
   let prev = null; try { const r = await kvGet(env,'asset_snapshot'); if(r) prev = JSON.parse(r); } catch(e){}
@@ -2097,6 +2166,7 @@ async function runProbeMonitoring(env){
   const waf = await checkWaf(env); await kvPut(env,'waf_status', waf);
   if(cfg.enabled && cfg.alerts && await notifReady(env)){ const sp = waf.filter(w=>w.blocked>=50000); if(sp.length) await sendTelegram(env, buildWafMsg(sp)); }
   await checkQuotaAlerts(env);
+  await storeAnalytics(env).catch(()=>{});
   try { const r = await kvGet(env,'tg_cron_heartbeat'); if(r){ const h = JSON.parse(r); if(!h.warned && Date.now()-h.last > 26*3600*1000){ await sendTelegram(env, '⏰ Cron 心跳异常：日报 cron 已超过 26 小时未运行，可能已被 CF 静默停止，请检查触发器配置。'); await kvPut(env,'tg_cron_heartbeat', Object.assign(h,{warned:true})); } } } catch(e){}
   await cleanupKV(env);
 }
@@ -2537,24 +2607,38 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
       <div class="header">
         <div style="font-size:20px;font-weight:700">总览</div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <button class="btn" onclick="restoreFromKV()">从 KV 同步账号</button>
+          <select id="dashScope" class="input" style="width:auto;max-width:260px" onchange="renderDashboard()"></select>
+          <button class="btn primary" id="dashCollectBtn" onclick="collectAnalyticsNow()">立即采集</button>
           <button class="btn" onclick="openAccountSwitcher()">切换执行账号</button>
         </div>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:16px">
-        <div class="metric"><div class="small">账号总数</div><div style="font-size:28px;font-weight:700" id="ovAccCount">-</div></div>
-        <div class="metric"><div class="small">有效</div><div style="font-size:28px;font-weight:700;color:#0f6e56" id="ovAccOk">-</div></div>
-        <div class="metric"><div class="small">异常 / 封号</div><div style="font-size:28px;font-weight:700;color:#a32d2d" id="ovAccBad">-</div></div>
-        <div class="metric"><div class="small">当前执行账号</div><div style="font-size:18px;font-weight:700;word-break:break-all" id="ovActive">未选择</div></div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-top:14px">
+        <div class="metric"><div class="small">24h 请求量</div><div style="font-size:26px;font-weight:700" id="dashReq">-</div></div>
+        <div class="metric"><div class="small">24h 带宽</div><div style="font-size:26px;font-weight:700" id="dashBytes">-</div></div>
+        <div class="metric"><div class="small">24h 访问者</div><div style="font-size:26px;font-weight:700" id="dashUniq">-</div></div>
+        <div class="metric"><div class="small">今日配额 (100k)</div><div style="font-size:26px;font-weight:700;color:#d97706" id="dashQuota">-</div></div>
+        <div class="metric"><div class="small">异常 / 封号</div><div style="font-size:26px;font-weight:700;color:#a32d2d" id="dashBad">-</div></div>
+        <div class="metric"><div class="small">最近采集</div><div style="font-size:15px;font-weight:700" id="dashTs">-</div></div>
       </div>
-      <div class="card" style="margin-top:16px">
-        <h3 style="margin:0 0 8px">使用指引</h3>
-        <div class="small" style="line-height:1.8">
-          · 全局设置（通知 / 日报 / Webhook / 加密）已鉴权即可用，无需登录任何 CF 账户。<br>
-          · 资源操作（Workers / Pages / KV / D1 / DNS 等）需先在「账号库」添加账号并设为执行账号。<br>
-          · 账号格式：邮箱 | Global API Key（可批量导入）；面板不会在 KV 之外保存凭据。
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+        <div class="card" style="margin-top:0">
+          <div style="font-weight:700;margin-bottom:4px">24h 请求走势</div>
+          <div id="dashTrend" class="small" style="font-family:monospace">-</div>
+        </div>
+        <div class="card" style="margin-top:0">
+          <div style="font-weight:700;margin-bottom:4px" id="dashShareTitle">各账号请求占比</div>
+          <div id="dashShare" class="small" style="font-family:monospace">-</div>
         </div>
       </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+        <div class="card" style="margin-top:0"><div style="font-weight:700">近 14 天请求 <span style="font-weight:400;font-size:11px;color:#94a3b8">(免费版自积累)</span></div><div id="dashDaily" class="small" style="font-family:monospace;margin-top:6px">-</div></div>
+        <div class="card" style="margin-top:0"><div style="font-weight:700">配额消耗 14 天</div><div id="dashQuotaChart" class="small" style="font-family:monospace;margin-top:6px">-</div></div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <h3 style="margin:0 0 8px">账号明细 <span class="small">点「Zones」下钻 · 点「设为执行」切换</span></h3>
+        <div id="dashTable" class="small" style="font-family:monospace"></div>
+      </div>
+      <div class="small" style="margin-top:10px;color:#94a3b8;line-height:1.7">免费计划官方分析仅保留最近 24h；多日曲线由本面板每 4h 自动采集累积。数据非实时，点「立即采集」刷新（会向每个有效账号发起一次 GraphQL 查询）。</div>
     </div>
 
     <!-- Accounts Page（账号库 · 全局） -->
@@ -3200,6 +3284,14 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
     </div>
 
 <!-- Modals -->
+<div id="dashZoneModal" class="modal"><div class="modal-box" style="max-width:560px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 style="margin:0">Zones 下钻</h3>
+    <button class="trash-btn" onclick="closeModal('dashZoneModal')">✕</button>
+  </div>
+  <div id="dashZoneBox" class="small" style="font-family:monospace;max-height:340px;overflow:auto"></div>
+</div></div>
+
 <div id="dnsIOModal" class="modal"><div class="modal-box" style="max-width:720px">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
     <h3 style="margin:0">DNS 导出 / 导入（BIND 格式）</h3>
@@ -3916,16 +4008,177 @@ function renderStaticJS(env) {
       } catch(e){}
       return loadSaved();
     }
+    // ===== 总览仪表板（全部账号/单账号隔离）=====
+    let dashCache = null;
+    function fmtNum(v){
+      v = v || 0;
+      if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+      if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+      if (v >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+      return String(v);
+    }
+    function dashScopeLabel(){
+      const v = el('dashScope').value;
+      if (!v) return '全部账号';
+      const opt = el('dashScope').selectedOptions[0];
+      return opt ? opt.textContent : v;
+    }
+    function dashPick(data){
+      const v = el('dashScope').value;
+      if (!v) return Object.keys(data || {}).map(k => data[k]);
+      const rec = (data || {})[v];
+      return rec ? [rec] : [];
+    }
+    function barHtml(pts, w){
+      const max = Math.max.apply(null, pts.map(p => p.v)) || 1;
+      return '<div style="display:flex;align-items:flex-end;gap:3px;height:86px">' + pts.map(p =>
+        '<div style="flex:1;min-width:0;background:#93c5fd;border-radius:2px 2px 0 0;height:' + Math.max(2, Math.round((p.v / max) * 80)) + 'px" title="' + escAttr(p.l + '  ' + fmtNum(p.v)) + '"></div>').join('') +
+        '</div><div style="display:flex;justify-content:space-between;color:#94a3b8;font-size:10px;margin-top:2px"><span>' + escAttr((pts[0] && pts[0].l) || '') + '</span><span>' + escAttr((pts[pts.length - 1] && pts[pts.length - 1].l) || '') + '</span></div>';
+    }
+    function dashUsagePct(usage){
+      const dates = Object.keys(usage || {}).sort();
+      if (!dates.length) return null;
+      const day = usage[dates[dates.length - 1]] || [];
+      const v = el('dashScope').value;
+      const rows = v ? day.filter(r => r.email === v) : day;
+      return { total: rows.reduce((t, r) => t + (r.total || 0), 0), rows, label: dates[dates.length - 1] };
+    }
     async function renderOverview(){
       const arr = await kvMergeAccounts();
-      const ok = arr.filter(a => !a.status || a.status === 'ok').length;
-      const bad = arr.filter(a => a.status && a.status !== 'ok').length;
-      if (el('ovAccCount')) el('ovAccCount').textContent = arr.length;
-      if (el('ovAccOk')) el('ovAccOk').textContent = ok;
-      if (el('ovAccBad')) el('ovAccBad').textContent = bad;
-      const act = getActiveCreds();
-      if (el('ovActive')) el('ovActive').textContent = act.oauthId ? (act.name || 'OAuth 连接') : act.email ? maskEmailShort(act.email) : '未选择';
+      const sel = el('dashScope');
+      if (sel && sel.options.length === 0) {
+        sel.innerHTML = '<option value="">全部账号</option>' + arr.map(a => '<option value="' + escAttr(a.email || a.name || a.oauthId) + '">' + escAttr(a.oauth ? (a.name || a.oauthId) : a.email) + '</option>').join('');
+      }
+      if (!dashCache) {
+        const r = await api('get-dashboard', {});
+        dashCache = (r && r.success) ? r.dash : null;
+      }
+      renderDash();
     }
+    async function collectAnalyticsNow(){
+      const btn = el('dashCollectBtn');
+      if (btn) { btn.disabled = true; btn.textContent = '采集中…'; }
+      try {
+        const r = await api('collect-analytics-now', {});
+        if (!r || !r.success) { showNotification((r && r.error) || '采集失败', 'error'); return; }
+        dashCache = null;
+        const d = await api('get-dashboard', {});
+        dashCache = (d && d.success) ? d.dash : null;
+        showNotification('采集完成：成功 ' + r.ok + ' 个账号' + (r.fail ? '，失败 ' + r.fail + ' 个' : ''));
+        renderDash();
+      } finally { if (btn) { btn.disabled = false; btn.textContent = '立即采集'; } }
+    }
+    function renderDash(){
+      const d = dashCache;
+      const t = (id, txt) => { const e = el(id); if (e) e.textContent = txt; };
+      if (!d || !d.snap || !d.snap.data) {
+        t('dashReq', '-'); t('dashBytes', '-'); t('dashUniq', '-'); t('dashQuota', '-'); t('dashBad', '-'); t('dashTs', '未采集');
+        el('dashTrend').innerHTML = '<span style="color:#94a3b8">暂无数据 —— 点击右上「立即采集」</span>';
+        el('dashShare').innerHTML = ''; el('dashShareTitle').textContent = '各账号请求占比';
+        el('dashDaily').innerHTML = '<span style="color:#94a3b8">-</span>';
+        el('dashQuotaChart').innerHTML = '<span style="color:#94a3b8">-</span>';
+        el('dashTable').innerHTML = '';
+        return;
+      }
+      const data = d.snap.data;
+      const recs = dashPick(data);
+      const req = recs.reduce((s, r) => s + (r.req || 0), 0);
+      const bytes = recs.reduce((s, r) => s + (r.bytes || 0), 0);
+      const uniq = recs.reduce((s, r) => s + (r.uniq || 0), 0);
+      t('dashReq', fmtNum(req)); t('dashBytes', fmtBytes(bytes)); t('dashUniq', fmtNum(uniq));
+      const bad = dashPick(d.accounts).filter(a => a.status && a.status !== 'ok').length;
+      t('dashBad', String(bad));
+      t('dashTs', new Date(d.snap.ts).toLocaleString('zh-CN', { hour12: false }));
+      const up = dashUsagePct(d.usage);
+      const scopeSingle = !!el('dashScope').value;
+      if (scopeSingle && up && up.rows.length) {
+        const pct = Math.round((up.total / 100000) * 100);
+        t('dashQuota', pct + '%');
+      } else if (up) {
+        const high = up.rows.filter(r => (r.total || 0) >= 50000).length;
+        const maxPct = up.rows.length ? Math.round((Math.max.apply(null, up.rows.map(r => r.total || 0)) / 100000) * 100) : 0;
+        t('dashQuota', maxPct + '%' + (high ? ' (' + high + ' 高危)' : ''));
+      } else t('dashQuota', '-');
+      // 24h 趋势
+      const hourMap = {};
+      recs.forEach(r => (r.points || []).forEach(p => { hourMap[p.t] = (hourMap[p.t] || 0) + (p.req || 0); }));
+      const hours = Object.keys(hourMap).sort();
+      const pts = hours.map(h => ({ l: h.slice(0, 5), v: hourMap[h] }));
+      t('dashTrend', pts.length ? '' : '无请求数据');
+      el('dashTrend').innerHTML = pts.length ? barHtml(pts) : '<span style="color:#94a3b8">近 24h 无请求</span>';
+      // 占比 / zones
+      const st = el('dashShareTitle');
+      if (scopeSingle && recs[0]) {
+        st.textContent = dashScopeLabel() + ' · Zones 排行';
+        const zs = (recs[0].zones || []).slice(0, 8);
+        const zmax = Math.max.apply(null, zs.map(z => z.req)) || 1;
+        el('dashShare').innerHTML = zs.length ? zs.map(z =>
+          '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px"><div style="flex:0 0 auto;font-size:11px;color:#334155;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escAttr(z.name) + '</div>' +
+          '<div style="flex:1;height:12px;background:#f1f5f9;border-radius:6px"><div style="height:12px;width:' + Math.max(2, Math.round((z.req / zmax) * 100)) + '%;background:#8b5cf6;border-radius:6px"></div></div>' +
+          '<div style="flex:0 0 auto;font-size:11px;color:#64748b">' + fmtNum(z.req) + '</div></div>').join('')
+          : '<span style="color:#94a3b8">该账号无 zones 数据</span>';
+      } else {
+        st.textContent = '各账号请求占比';
+        const all = Object.keys(data).map(k => data[k]).sort((a, b) => (b.req || 0) - (a.req || 0)).slice(0, 8);
+        const amax = Math.max.apply(null, all.map(a => a.req)) || 1;
+        el('dashShare').innerHTML = all.length ? all.map(a =>
+          '<div style="display:flex;align-items:center;gap:6px;margin-bottom:5px"><div style="flex:0 0 auto;font-size:11px;color:#334155;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escAttr(a.email || a.name || '?') + '</div>' +
+          '<div style="flex:1;height:12px;background:#f1f5f9;border-radius:6px"><div style="height:12px;width:' + Math.max(2, Math.round(((a.req || 0) / amax) * 100)) + '%;background:#3b82f6;border-radius:6px"></div></div>' +
+          '<div style="flex:0 0 auto;font-size:11px;color:#64748b">' + fmtNum(a.req) + '</div></div>').join('')
+          : '<span style="color:#94a3b8">暂无账号请求数据</span>';
+      }
+      // 近 14 天请求（自积累）
+      const dk = Object.keys(d.daily || {}).sort().slice(-14);
+      const dpts = dk.map(dd => {
+        const rows = Object.keys(d.daily[dd] || {}).map(k => d.daily[dd][k]);
+        const selV = el('dashScope').value;
+        const sum = rows.filter(r => !selV || r.email === selV).reduce((s, r) => s + (r.req || 0), 0);
+        return { l: dd.slice(5), v: sum };
+      });
+      el('dashDaily').innerHTML = dpts.length ? barHtml(dpts) : '<span style="color:#94a3b8">暂无历史（需每日采集累积）</span>';
+      // 配额 14 天
+      const uk = Object.keys(d.usage || {}).sort().slice(-14);
+      const qpts = uk.map(dd => {
+        const rows = (d.usage[dd] || []).filter(r => !el('dashScope').value || r.email === el('dashScope').value);
+        return { l: dd.slice(5), v: rows.reduce((s, r) => s + (r.total || 0), 0) };
+      });
+      const quotaWarn = qpts.length >= 3 && qpts.slice(-7).reduce((s, p) => s + p.v, 0) / Math.min(7, qpts.length) > 80000;
+      el('dashQuotaChart').innerHTML = (qpts.length ? barHtml(qpts) : '<span style="color:#94a3b8">-</span>') + (quotaWarn ? '<div style="color:#b45309;margin-top:4px;font-size:11px">近 7 日均值 &gt; 8 万，可能提前耗尽配额</div>' : '');
+      // 明细表
+      const rowsHtml = recs.map(a => {
+        const accMeta = (d.accounts || []).find(x => (x.email || x.name) === (a.email || a.name));
+        const okStatus = !accMeta || !accMeta.status || accMeta.status === 'ok';
+        const pct = up && scopeSingle ? Math.round((up.total / 100000) * 100) : null;
+        return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed #eef2f6;flex-wrap:wrap">' +
+          '<div style="flex:1;min-width:150px"><span style="color:' + (okStatus ? '#0f6e56' : '#a32d2d') + '">●</span> <b>' + escAttr(a.email || a.name || '?') + '</b>' + (a.zones ? ' <span style="color:#94a3b8;font-size:11px">' + a.zones.length + ' zones</span>' : '') + '</div>' +
+          '<div style="font-size:12px;color:#475569;width:70px;text-align:right">' + fmtNum(a.req) + '</div>' +
+          '<div style="font-size:12px;color:#475569;width:76px;text-align:right">' + fmtBytes(a.bytes) + '</div>' +
+          '<div style="font-size:12px;color:#d97706;width:52px;text-align:right">' + (pct != null ? pct + '%' : '') + '</div>' +
+          '<div style="display:flex;gap:6px">' +
+          '<button class="btn small" onclick="openDashZones(\\'' + (a.email || a.name) + '\\')">Zones</button>' +
+          '<button class="btn small" onclick="dashSetActive(\\'' + (a.email || a.name) + '\\')">设为执行</button></div></div>';
+      }).join('');
+      el('dashTable').innerHTML = recs.length ? rowsHtml : '<span style="color:#94a3b8">该作用域暂无数据（点「立即采集」拉取）</span>';
+    }
+    function openDashZones(emailKey){
+      const data = (dashCache && dashCache.snap && dashCache.snap.data) || {};
+      const rec = data[emailKey];
+      if (!rec) return showNotification('无该账号分析数据', 'error');
+      el('dashZoneBox').innerHTML = '<div style="font-weight:700;margin-bottom:8px">' + escAttr(emailKey) + ' · Zones（24h 请求降序）</div>' +
+        (rec.zones && rec.zones.length ? rec.zones.map(z =>
+          '<div style="display:flex;justify-content:space-between;gap:8px;padding:5px 0;border-bottom:1px dashed #eef2f6"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escAttr(z.name) + '</span><span style="color:#475569">' + fmtNum(z.req) + ' req</span><span style="color:#94a3b8;width:76px;text-align:right">' + fmtBytes(z.bytes) + '</span></div>').join('')
+          : '<span style="color:#94a3b8">无 zones 数据</span>');
+      el('dashZoneModal').style.display = 'flex';
+    }
+    function dashSetActive(emailKey){
+      const arr = loadSaved();
+      const i = arr.findIndex(a => (a.email || a.name || a.oauthId) === emailKey);
+      if (i === -1) return showNotification('本地账号库未找到该账号，请先「从 KV 同步/账号库添加」', 'error');
+      if (arr[i] && arr[i].oauth) { localStorage.setItem('cf_active_oauth', arr[i].oauthId); localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); }
+      else { localStorage.setItem('cf_active_email', arr[i].email); localStorage.setItem('cf_active_key', arr[i].key); localStorage.removeItem('cf_active_oauth'); }
+      localStorage.removeItem('cf_accountId'); updateAcctBadge(); showNotification('已设为执行账号：' + emailKey);
+    }
+    window.renderDash = renderDash; window.collectAnalyticsNow = collectAnalyticsNow; window.openDashZones = openDashZones; window.dashSetActive = dashSetActive;
     async function renderAccounts(){
       const arr = await kvMergeAccounts();
       const box = el('accountsBox'); if (!box) return;
