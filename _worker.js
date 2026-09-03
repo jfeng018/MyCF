@@ -6114,14 +6114,16 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
       el('workersList').innerHTML = '加载中...';
       const accounts = await api('list-accounts');
       if (!accounts || !accounts.result) { 
-        el('workersList').innerHTML = '无法获取账户'; 
+        el('workersList').innerHTML = '无法获取账户' + ((accounts && accounts.error) ? '：' + escapeHtml(accounts.error) : ''); 
         return; 
       }
       const accountId = accounts.result[0].id || accounts.result[0].account_id;
       localStorage.setItem('cf_accountId', accountId);
       const res = await api('list-workers', { accountId });
       if (!res || !res.result) { 
-        el('workersList').innerHTML = '获取 Workers 失败'; 
+        const e0 = res && res.errors && res.errors[0];
+        const em = (e0 && (e0.message || e0.code)) || (res && res.error) || '';
+        el('workersList').innerHTML = '获取 Workers 失败' + (em ? '：' + escapeHtml(String(em)) : '') + '<div class="small" style="margin-top:6px">当前执行账号对该 Account 无权限/鉴权失败时，请确认左上角执行账号正确后刷新本页重试；若仍失败请把本条提示原文发回。</div>'; 
         return; 
       }
       
