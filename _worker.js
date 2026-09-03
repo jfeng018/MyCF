@@ -3269,9 +3269,12 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <label><input type="checkbox" id="tgAlerts" checked> 配额告警(50/80/95%)</label>
         <label><input type="checkbox" id="tgTraffic" checked> 流量突增/归零告警</label>
       </div>
-      <div style="margin-top:8px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
-        <label style="display:flex;align-items:center;gap:6px;color:#475569">日报时段(北京时)：<select id="tgReportHour" class="input" style="width:auto"></select></label>
-        <span class="small" style="color:#94a3b8">每个整点后第 23 分触发；默认北京 7 点(=UTC 23)</span>
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+        <div style="display:flex;align-items:flex-start;gap:8px;color:#475569;flex-wrap:wrap">
+          <span style="padding-top:4px">日报时段(北京时,可多选)：</span>
+          <div id="tgReportHours" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"></div>
+        </div>
+        <span class="small" style="color:#94a3b8">每个整点后第 23 分触发，一天可推多次（多选=早/中/晚各一份）；默认北京 7 点(=UTC 23)</span>
       </div>
       <div style="margin-top:6px;display:flex;gap:16px;flex-wrap:wrap;align-items:center;color:#475569">
         <span>日报包含：</span>
@@ -4500,6 +4503,39 @@ function renderStaticJS(env) {
       localStorage.removeItem('cf_accountId'); updateAcctBadge(); showNotification('已切换执行账号');
       renderAccounts();
     }
+    // 构建日报时段多选 chips（北京时 06:23–23:23，18 档；UTC=北京-8）
+    function buildTgHourChips(){
+      const box = el('tgReportHours');
+      if (!box || box.dataset.built) return;
+      box.dataset.built = '1';
+      box.innerHTML = '';
+      const chipStyle = 'display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border:1px solid #e2e8f0;border-radius:999px;cursor:pointer;font-size:12px;color:#475569';
+      for (let bj = 6; bj <= 23; bj++) {
+        const lab = document.createElement('label');
+        lab.style.cssText = chipStyle;
+        const cb = document.createElement('input');
+        cb.type = 'checkbox'; cb.value = String(bj);
+        lab.appendChild(cb);
+        const sp = document.createElement('span');
+        sp.textContent = String(bj).padStart(2, '0') + ':23';
+        lab.appendChild(sp);
+        box.appendChild(lab);
+      }
+      const util = document.createElement('div');
+      util.style.cssText = 'display:flex;gap:12px;align-items:center;width:100%';
+      const mk = (txt, fn) => {
+        const a = document.createElement('a');
+        a.href = 'javascript:void(0)';
+        a.textContent = txt;
+        a.style.cssText = 'font-size:12px;color:#2563eb';
+        a.addEventListener('click', fn);
+        util.appendChild(a);
+      };
+      mk('全部勾选', () => box.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = true));
+      mk('只留默认 07:23', () => { box.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false); const d = box.querySelector('input[value="7"]'); if (d) d.checked = true; });
+      mk('清除全部', () => box.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false));
+      box.appendChild(util);
+    }
     async function loadSettingsAll(){
       loadSubdomainSettings();
       loadOAuthUI();
@@ -4507,12 +4543,12 @@ function renderStaticJS(env) {
         if (r.config.botTokenSet) el('tgBotToken').placeholder = '已保存 (' + r.config.botToken + ')';
         if (r.config.chatId) el('tgChatId').value = r.config.chatId;
         el('tgEnabled').checked = r.config.enabled !== false; el('tgDaily').checked = r.config.dailyReport !== false; el('tgAlerts').checked = r.config.alerts !== false; if (el('tgTraffic')) el('tgTraffic').checked = r.config.alertsTraffic !== false;
-        const uh = (r.config.reportHours && r.config.reportHours.length) ? r.config.reportHours[0] : 23;
-        const rhs = el('tgReportHour');
-        if (rhs) {
-          if (!rhs.options.length) { for (let bj = 6; bj <= 23; bj++) { const o = document.createElement('option'); o.value = String(bj); o.textContent = bj + ':23'; rhs.appendChild(o); } }
-          rhs.value = String((uh + 8) % 24);
-        }
+        const hrs = (r.config.reportHours && r.config.reportHours.length) ? r.config.reportHours : [23];
+        buildTgHourChips();
+        const want = new Set(hrs.map(h => (h + 8) % 24));
+        document.querySelectorAll('#tgReportHours input[type=checkbox]').forEach(c => { c.checked = want.has(Number(c.value)); });
+        const any = Array.from(document.querySelectorAll('#tgReportHours input[type=checkbox]')).some(c => c.checked);
+        if (!any) { const d = document.querySelector('#tgReportHours input[value="7"]'); if (d) d.checked = true; }
         const seg = r.config.segments || {};
         if (el('tgSegQuota')) el('tgSegQuota').checked = seg.quota !== false;
         if (el('tgSegTraffic')) el('tgSegTraffic').checked = seg.traffic !== false;
@@ -5889,8 +5925,8 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
 
     function maskEmailFront(e){ const i = String(e||'').indexOf('@'); if(i <= 0) return e||''; const u = e.slice(0,i), d = e.slice(i+1); return (u.length <= 1 ? '*' : u.slice(0,1) + '***') + '@' + d; }
     async function saveTGConfig(){
-      const rhs = el('tgReportHour');
-      const uh = rhs && rhs.value !== '' ? ((Number(rhs.value) - 8 + 24) % 24) : 23;
+      const checkedBjs = Array.from(document.querySelectorAll('#tgReportHours input[type=checkbox]:checked')).map(c => Number(c.value));
+      const reportHours = checkedBjs.length ? checkedBjs.map(bj => (bj - 8 + 24) % 24).sort((a, b) => a - b) : [23];
       const config = {
         botToken: el('tgBotToken').value.trim(),
         chatId: el('tgChatId').value.trim(),
@@ -5898,7 +5934,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
         dailyReport: el('tgDaily').checked,
         alerts: el('tgAlerts').checked,
         alertsTraffic: !el('tgTraffic') || el('tgTraffic').checked,
-        reportHours: [uh],
+        reportHours,
         segments: {
           quota: !el('tgSegQuota') || el('tgSegQuota').checked,
           traffic: !el('tgSegTraffic') || el('tgSegTraffic').checked,
@@ -5906,7 +5942,8 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
         }
       };
       const r = await api('save-tg-config', { config });
-      if(r && r.success) showNotification('TG 配置已保存'); else showNotification((r&&r.error)||'保存失败','error');
+      if(r && r.success){ if (!checkedBjs.length) showNotification('未勾选时段，已按默认北京 7 点(UTC 23)推送'); else showNotification('TG 配置已保存（日报 ' + reportHours.length + ' 个时段）'); }
+      else showNotification((r&&r.error)||'保存失败','error');
     }
     async function testTG(){
       const r = await api('push-tg-test', {});
