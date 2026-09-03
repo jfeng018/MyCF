@@ -2118,7 +2118,7 @@ async function storeOfficialAnalytics(env, days = 92){
       if(!key){ fail++; continue; }
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
       if(!accountId){ fail++; continue; }
-      const q = 'query($tag:String!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:"' + ge + '",date_leq:"' + le + '"}){dimensions{date}sum{requests bytes pageViews}uniq{uniques}}}}}}';
+      const q = 'query($tag:String!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:"' + ge + '",date_leq:"' + le + '"}){dimensions{date}sum{requests bytes pageViews cachedRequests threats}uniq{uniques}}}}}}';
       const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId } }) });
       const res = await g.json();
       const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
@@ -2128,8 +2128,9 @@ async function storeOfficialAnalytics(env, days = 92){
         for(const d of (z.httpRequests1dGroups || [])){
           const dt = d.dimensions && d.dimensions.date; if(!dt) continue;
           const s = d.sum || {}, u = d.uniq || {};
-          const rec = dayMap[dt] = dayMap[dt] || { req:0, bytes:0, uniq:0, pageViews:0 };
+          const rec = dayMap[dt] = dayMap[dt] || { req:0, bytes:0, uniq:0, pageViews:0, cachedRequests:0, threats:0 };
           rec.req += (s.requests || 0); rec.bytes += (s.bytes || 0); rec.pageViews += (s.pageViews || 0); rec.uniq += (u.uniques || 0);
+          rec.cachedRequests += (s.cachedRequests || 0); rec.threats += (s.threats || 0);
         }
       }
       if(!merged){
@@ -2143,7 +2144,12 @@ async function storeOfficialAnalytics(env, days = 92){
       ok++;
     } catch(e){ fail++; }
   }
-  if(ok && merged){ merged.fetchedAt = new Date().toISOString(); await kvPut(env, 'official_daily', merged); }
+  if(ok && merged){
+    // 保留期裁剪：仅保留最近 days+15 天的日期，防 KV 无限膨胀
+    const ds = Object.keys(merged.data).sort(); const keep = ds.slice(-(days + 15));
+    if (keep.length < ds.length) { const drop = new Set(ds.slice(0, ds.length - keep.length)); for (const d of drop) delete merged.data[d]; }
+    merged.fetchedAt = new Date().toISOString(); await kvPut(env, 'official_daily', merged);
+  }
   return { ok, fail };
 }
 
@@ -2902,6 +2908,8 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <div class="metric"><div class="small">24h 请求量</div><div style="font-size:26px;font-weight:700" id="dashReq">-</div></div>
         <div class="metric"><div class="small">24h 带宽</div><div style="font-size:26px;font-weight:700" id="dashBytes">-</div></div>
         <div class="metric"><div class="small">24h 访问者</div><div style="font-size:26px;font-weight:700" id="dashUniq">-</div></div>
+        <div class="metric"><div class="small">缓存命中率(官方日)</div><div style="font-size:26px;font-weight:700;color:#0f6e56" id="dashCache">-</div></div>
+        <div class="metric"><div class="small">威胁拦截(官方日)</div><div style="font-size:26px;font-weight:700;color:#b45309" id="dashThreats">-</div></div>
         <div class="metric"><div class="small">今日配额 (100k)</div><div style="font-size:26px;font-weight:700;color:#d97706" id="dashQuota">-</div></div>
         <div class="metric"><div class="small">异常 / 封号</div><div style="font-size:26px;font-weight:700;color:#a32d2d" id="dashBad">-</div></div>
         <div class="metric"><div class="small">最近采集</div><div style="font-size:15px;font-weight:700" id="dashTs">-</div></div>
@@ -4058,13 +4066,20 @@ function renderStaticJS(env) {
   let _busy = 0;
   function updateBusy(){ const b = el('globalBusy'); if (b) b.style.display = _busy > 0 ? 'inline-block' : 'none'; }
   function stampRefresh(){ const s = el('lastUpdated'); if (s) s.textContent = '最后更新 ' + new Date().toLocaleTimeString('zh-CN', { hour12:false }); }
+  let _zonesCache = null, _zonesCacheT = 0, _zonesCacheEmail = '', _zonesCacheOa = '';
   async function api(action, body) {
+    const c = getActiveCreds();
+    // 会话内 zone 列表缓存 60s：WAF/优化/邮箱等页面频繁 list-zones，省一次后端往返与 REST 配额
+    if (action === 'list-zones' && !(body && body.forceRefresh) && _zonesCache && Date.now() - _zonesCacheT < 60000 && c.email === _zonesCacheEmail && (c.oauthId || '') === _zonesCacheOa) {
+      return { success: true, result: _zonesCache };
+    }
     _busy++; updateBusy();
     try {
-      const c = getActiveCreds();
       const payload = Object.assign({ action }, c, body);
       const r = await fetch('/api', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-      try { const j = await r.json(); stampRefresh(); return j; } catch (e) { return await r.text(); }
+      let j = null; try { j = await r.json(); } catch (e) {}
+      if (j) { stampRefresh(); if (action === 'list-zones' && j.success && Array.isArray(j.result)) { _zonesCache = j.result; _zonesCacheT = Date.now(); _zonesCacheEmail = c.email; _zonesCacheOa = c.oauthId || ''; } return j; }
+      const txt = await r.text(); stampRefresh(); return txt;
     } finally { _busy--; updateBusy(); }
   }
 
@@ -4403,7 +4418,7 @@ function renderStaticJS(env) {
       const d = dashCache;
       const t = (id, txt) => { const e = el(id); if (e) e.textContent = txt; };
       if (!d || !d.snap || !d.snap.data) {
-        t('dashReq', '-'); t('dashBytes', '-'); t('dashUniq', '-'); t('dashQuota', '-'); t('dashBad', '-'); t('dashTs', '未采集');
+        t('dashReq', '-'); t('dashBytes', '-'); t('dashUniq', '-'); t('dashCache', '-'); t('dashThreats', '-'); t('dashQuota', '-'); t('dashBad', '-'); t('dashTs', '未采集');
         el('dashTrend').innerHTML = '<span style="color:#94a3b8">暂无数据 —— 点击右上「立即采集」</span>';
         el('dashShare').innerHTML = ''; el('dashShareTitle').textContent = '各账号请求占比';
         el('dashDaily').innerHTML = '<span style="color:#94a3b8">-</span>';
@@ -4417,6 +4432,19 @@ function renderStaticJS(env) {
       const bytes = recs.reduce((s, r) => s + (r.bytes || 0), 0);
       const uniq = recs.reduce((s, r) => s + (r.uniq || 0), 0);
       t('dashReq', fmtNum(req)); t('dashBytes', fmtBytes(bytes)); t('dashUniq', fmtNum(uniq));
+      // 缓存命中率 / 威胁拦截：官方按日(httpRequests1dGroups 的 cachedRequests/threats)最近一天，按作用域聚合
+      const odMap = (d.officialDaily && Object.keys(d.officialDaily).length) ? d.officialDaily : null;
+      if (odMap) {
+        const lastD = Object.keys(odMap).sort().pop();
+        const rows = Object.values(odMap[lastD] || {});
+        const selV2 = el('dashScope').value;
+        const rs2 = rows.filter(r => !selV2 || r.email === selV2);
+        const oReq = rs2.reduce((s, r) => s + (r.req || 0), 0);
+        const oCached = rs2.reduce((s, r) => s + (r.cachedRequests || 0), 0);
+        const oThreats = rs2.reduce((s, r) => s + (r.threats || 0), 0);
+        if (oReq > 0) { t('dashCache', Math.round((oCached / oReq) * 100) + '%'); t('dashThreats', fmtNum(oThreats)); }
+        else { t('dashCache', '-'); t('dashThreats', '-'); }
+      } else { t('dashCache', '-'); t('dashThreats', '-'); }
       const bad = dashPick(d.accounts).filter(a => a.status && a.status !== 'ok').length;
       t('dashBad', String(bad));
       t('dashTs', new Date(d.snap.ts).toLocaleString('zh-CN', { hour12: false }));
