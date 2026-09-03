@@ -1141,6 +1141,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         if (typeof cfg.enabled === 'boolean') merged.enabled = cfg.enabled;
         if (typeof cfg.dailyReport === 'boolean') merged.dailyReport = cfg.dailyReport;
         if (typeof cfg.alerts === 'boolean') merged.alerts = cfg.alerts;
+        if (typeof cfg.alertsTraffic === 'boolean') merged.alertsTraffic = cfg.alertsTraffic;
         await env.CF_ACCOUNTS_KV.put('tg_config', JSON.stringify(merged));
         return json({ success: true });
       }
@@ -1498,7 +1499,8 @@ async function handleOAuthCallback(env, url){
       added: new Date().toISOString().slice(0, 10),
       status: 'ok'
     };
-    await upsertOAuthAccount(env, acc);
+    const mergedAcc = await upsertOAuthAccount(env, acc);
+    try { await sendTelegram(env, '✅ OAuth 授权完成\n账号：' + (acc.name || acc.email || acc.oauthId) + (acc.scope ? '\nScope：' + String(acc.scope).slice(0, 120) : '') + ((mergedAcc && mergedAcc.key) ? '\n（该账号已并存 Global Key，OAuth 失效时自动回退）' : ''), 'OAuth'); } catch(e){}
     return Response.redirect(url.origin + '/workers?oauth=ok', 302);
   } catch(e){ return errRedirect('OAuth 完成失败：' + e.message); }
 }
@@ -1601,7 +1603,12 @@ function splitTGMessage(text){
 }
 // ---- Telegram 机器人指令 ----
 const TG_COMMANDS = [
-  { command:'report', description:'立即推送每日用量报告' },
+  { command:'report', description:'立即推送每日用量/流量报告' },
+  { command:'dash', description:'推送今日账号池摘要' },
+  { command:'status', description:'账号池健康(异常/证书/探活/WAF)' },
+  { command:'top', description:'账号 24h 请求排行' },
+  { command:'zone', description:'查询某账号 Zones Top(带账号关键字)' },
+  { command:'oauth', description:'OAuth 连接状态' },
   { command:'probe', description:'立即执行端点探活并推送状态' },
   { command:'help', description:'显示可用指令' }
 ];
@@ -1656,7 +1663,7 @@ async function getTGWebhook(env){
   } };
 }
 function tgHelpText(){
-  return '🤖 MyCF 机器人指令：\n/report - 立即推送每日用量报告\n/probe - 立即执行端点探活并推送状态\n/help - 显示本帮助';
+  return '🤖 MyCF 机器人指令：\n/report - 立即推送每日用量+流量报告\n/dash - 今日账号池摘要\n/status - 账号池健康(异常/证书/探活/WAF)\n/top - 账号 24h 请求排行\n/zone <关键字> - 该账号 Zones Top10\n/oauth - OAuth 连接状态\n/probe - 立即执行端点探活\n/help - 显示本帮助';
 }
 async function saveTGConfigRaw(env, cfg){
   if(!env || !env.CF_ACCOUNTS_KV) return;
@@ -1693,17 +1700,30 @@ async function handleTelegramWebhook(request, env){
     return new Response('ok', { status: 200 });
   }
   try {
-    if(t === '/help' || t === 'help' || t === '菜单'){
-      await sendTelegramTo(env, chatId, tgHelpText());
-    } else if(t === '/report' || t === 'report'){
+    const cmd = t.split(/\s+/)[0].toLowerCase().replace(/^\/+/, '');
+    const arg = t.slice(t.indexOf(' ') + 1).trim();
+    const say = (msg) => sendTelegramTo(env, chatId, msg);
+    if(cmd === 'help' || cmd === '菜单'){
+      await say(tgHelpText());
+    } else if(cmd === 'report'){
       const r = await pushDailyReport(env, true);
-      if(!r.ok) await sendTelegramTo(env, chatId, '❌ 日报推送失败：' + (r.error||''));
-    } else if(t === '/probe' || t === 'probe'){
-      await sendTelegramTo(env, chatId, '⏳ 正在执行端点探活...');
+      if(!r.ok) await say('❌ 日报推送失败：' + (r.error||''));
+    } else if(cmd === 'dash'){
+      await say(await tgDashDigest(env));
+    } else if(cmd === 'status'){
+      await say(await tgStatusDigest(env));
+    } else if(cmd === 'top'){
+      await say(await tgTopAccounts(env));
+    } else if(cmd === 'zone'){
+      await say(await tgZoneTop(env, arg));
+    } else if(cmd === 'oauth'){
+      await say(await tgOauthStatus(env));
+    } else if(cmd === 'probe'){
+      await say('⏳ 正在执行端点探活...');
       await runProbeMonitoring(env);
-      await sendTelegramTo(env, chatId, '✅ 探活完成（异常会单独告警）');
+      await say('✅ 探活完成（异常会单独告警）');
     } else if(t){
-      await sendTelegramTo(env, chatId, '未知指令，发送 /help 查看可用指令');
+      await say('未知指令，发送 /help 查看可用指令');
     }
   } catch(e){
     try { await sendTelegramTo(env, chatId, '⚠️ 处理指令出错：' + String(e).slice(0,200)); } catch(_){}
@@ -1734,18 +1754,33 @@ async function queryAllUsageForCred(env, cred){
   if(!ar || !ar.success || !Array.isArray(ar.result)) return [{ email:cred.email, error:'无法获取账号列表' }];
   const out = [];
   for(const a of ar.result){
-    const u = await queryUsageByAccountId(cred.email, cred.key, a.id);
+    const u = await queryUsageByAccountId(cred.email, oauthOrKey(cred), a.id);
     out.push({ email:cred.email, accountId:a.id, name:a.name, ...u });
   }
   return out;
 }
-function buildDailyReport(results, dateStr){
+function fmtBytesB(b){
+  if (!b) return '0B';
+  const u = ['B','KB','MB','GB','TB']; let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 ? 0 : 1) + u[i];
+}
+function buildDailyReport(results, dateStr, ctx){
+  ctx = ctx || {};
   const ok = results.filter(r=>!r.error).sort((a,b)=>(b.total||0)-(a.total||0));
   const fail = results.filter(r=>r.error);
   const ranks = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩'];
   const L = [];
-  L.push('📊 MyCF 每日请求报告');
+  L.push('📊 MyCF 每日报告');
   L.push('🗓 ' + dateStr + ' (UTC)');
+  const sd = ctx.snapData || {};
+  const allRecs = Object.keys(sd).map(k => sd[k]);
+  if(allRecs.length){
+    const tReq = allRecs.reduce((s,r)=>s+(r.req||0),0);
+    const tB = allRecs.reduce((s,r)=>s+(r.bytes||0),0);
+    const tU = allRecs.reduce((s,r)=>s+(r.uniq||0),0);
+    L.push('🌐 账号池 24h：请求 ' + fmtNum(tReq) + ' · 流量 ' + fmtBytesB(tB) + ' · 访问 ' + fmtNum(tU));
+  }
   const acctLabel = fail.length ? (ok.length + ' 个有效（共 ' + results.length + ' 个）') : (results.length + ' 个账号');
   L.push('👥 ' + acctLabel);
   L.push('════════════════════════');
@@ -1756,25 +1791,155 @@ function buildDailyReport(results, dateStr){
     const rank = ranks[idx] || ((idx+1) + '.');
     L.push('');
     L.push(rank + ' ' + masked + name);
-    L.push('   ' + fmtNum(r.total) + ' / 100,000  (' + pct.toFixed(1) + '%)');
-    L.push('   ' + relBar(r.total, 100000, 16) + '  额度用量');
-    L.push('   Workers ' + fmtNum(r.workers) + '  ·  Pages ' + fmtNum(r.pages));
+    L.push('   配额 ' + fmtNum(r.total) + ' / 100,000  (' + pct.toFixed(1) + '%)  ' + relBar(r.total, 100000, 12));
+    L.push('   Workers ' + fmtNum(r.workers) + ' · Pages ' + fmtNum(r.pages));
     if(r.byScript && r.byScript.length){
       const top = r.byScript.slice(0,5).map(s=> s.script + ' ' + fmtNum(s.requests)).join(' · ');
       L.push('   Top: ' + top);
     }
+    const s = sd[r.email];
+    if(s){
+      L.push('   🚦 请求 ' + fmtNum(s.req) + ' · 流量 ' + fmtBytesB(s.bytes) + ' · 访问 ' + fmtNum(s.uniq));
+      const zt = (s.zones||[]).slice(0,3);
+      if(zt.length) L.push('   Zones: ' + zt.map(z => z.name + ' ' + fmtNum(z.req)).join(' · '));
+    }
   });
   fail.forEach(r=>{
     const masked = maskEmail(r.email);
-    const name = r.name ? ' · ' + r.name : '';
     L.push('');
-    L.push('⚠ ' + masked + name);
+    L.push('⚠ ' + masked + ' ' + (r.name||''));
     L.push('   查询失败: ' + (r.error||'未知错误'));
   });
+  const hs = [];
+  const abn = ctx.abnormal || [];
+  if(abn.length) hs.push('🚫 异常账号 ' + abn.length + '：' + abn.map(a => maskEmail(a.email)).join('、'));
+  const certDue = (ctx.certs || []).filter(c => c.days !== null && c.days <= 7).length;
+  if(certDue) hs.push('🛡 证书 ' + certDue + ' 张 7 天内到期');
+  const down = (ctx.probes || []).filter(p => !p.ok).length;
+  if(down) hs.push('📡 探活下线 ' + down + ' 个端点');
+  const wafN = (ctx.waf || []).filter(w => w.blocked >= 50000).length;
+  if(wafN) hs.push('🔥 WAF 拦截突增 ' + wafN + ' 个 zone');
+  if(hs.length){ L.push(''); L.push('───── 健康 ─────'); hs.forEach(h => L.push(h)); }
   L.push('');
   L.push('────────────────────────');
-  L.push('由 MyCF 自动推送 · 配额每日 UTC 重置');
+  L.push('由 MyCF 自动推送 · 配额 UTC 重置 · 流量为最近 24h 采集快照');
   return L.join('\n');
+}
+async function tgDashDigest(env){
+  const L = ['📊 MyCF 今日摘要'];
+  let snap = null; try { const r = await kvGet(env,'an_snap'); if(r) snap = JSON.parse(r); } catch(e){}
+  let daily = {}; try { const r = await kvGet(env,'an_daily'); if(r) daily = JSON.parse(r)||{}; } catch(e){}
+  const accounts = await loadKVAccounts(env).catch(()=>[]);
+  const abnormal = accounts.filter(a => a.status && a.status !== 'ok');
+  const sd = (snap && snap.data) || {};
+  const recs = Object.keys(sd).map(k => sd[k]);
+  if(recs.length){
+    L.push('🌐 账号池 24h：请求 ' + fmtNum(recs.reduce((s,r)=>s+(r.req||0),0)) +
+      ' · 流量 ' + fmtBytesB(recs.reduce((s,r)=>s+(r.bytes||0),0)) +
+      ' · 访问 ' + fmtNum(recs.reduce((s,r)=>s+(r.uniq||0),0)));
+    const top = recs.slice().sort((a,b)=>(b.req||0)-(a.req||0)).slice(0,5);
+    top.forEach((r,i) => L.push((i+1) + '. ' + maskEmail(r.email) + ' ' + fmtNum(r.req) + ' req'));
+  } else {
+    L.push('暂无 24h 流量数据（请先在面板总览「立即采集」）');
+  }
+  if(abnormal.length) L.push('🚫 异常账号 ' + abnormal.length);
+  L.push('👥 共 ' + accounts.length + ' 个账号' + (snap && snap.ts ? ' · 采集于 ' + new Date(snap.ts).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}).slice(5,16) : ''));
+  return L.join('\n');
+}
+async function tgStatusDigest(env){
+  const L = ['🩺 MyCF 账号池健康'];
+  const accounts = await loadKVAccounts(env).catch(()=>[]);
+  const abn = accounts.filter(a => a.status && a.status !== 'ok');
+  L.push('👥 账号 ' + accounts.length + '（OAuth ' + accounts.filter(a=>a.oauth).length + '）');
+  L.push(abn.length ? '🚫 异常 ' + abn.length + '：' + abn.map(a => maskEmail(a.email)).join('、') : '✅ 无异常账号');
+  let certs = []; try { const r = await kvGet(env,'cert_expiry'); if(r) certs = JSON.parse(r)||[]; } catch(e){}
+  const cd = certs.filter(c=>c.days!==null && c.days<=7);
+  L.push('🛡 证书 7 天内到期：' + (cd.length ? cd.map(c=>c.zone).slice(0,5).join('、') : '无'));
+  let probes = []; try { const r = await kvGet(env,'health_probe'); if(r) probes = JSON.parse(r)||[]; } catch(e){}
+  const dwn = probes.filter(p=>!p.ok);
+  L.push('📡 探活下线：' + (dwn.length ? dwn.slice(0,5).map(p=>p.worker).join('、') : '无'));
+  let waf = []; try { const r = await kvGet(env,'waf_status'); if(r) waf = JSON.parse(r)||[]; } catch(e){}
+  const ws = waf.filter(w=>w.blocked>=50000);
+  L.push('🔥 WAF 拦截突增：' + (ws.length ? ws.length + ' 个 zone' : '无'));
+  return L.join('\n');
+}
+async function tgTopAccounts(env){
+  let snap = null; try { const r = await kvGet(env,'an_snap'); if(r) snap = JSON.parse(r); } catch(e){}
+  const sd = (snap && snap.data) || {};
+  const recs = Object.keys(sd).map(k => sd[k]).sort((a,b)=>(b.req||0)-(a.req||0));
+  const L = ['🏆 账号 24h 请求排行'];
+  if(!recs.length){ L.push('暂无流量数据（请先「立即采集」）'); return L.join('\n'); }
+  recs.slice(0,10).forEach((r,i) => {
+    const pct = recs[0].req ? Math.round((r.req / recs[0].req) * 100) : 0;
+    L.push((i+1) + '. ' + maskEmail(r.email) + '  ' + fmtNum(r.req) + ' (' + pct + '%)' + relBar(r.req, recs[0].req || 1, 10));
+  });
+  return L.join('\n');
+}
+async function tgZoneTop(env, arg){
+  let snap = null; try { const r = await kvGet(env,'an_snap'); if(r) snap = JSON.parse(r); } catch(e){}
+  const sd = (snap && snap.data) || {};
+  if(!arg){ return '用法：/zone <账号关键字>，例如 /zone @gmail 或 /zone a@x.com'; }
+  const key = Object.keys(sd).find(k => k.toLowerCase().indexOf(arg.toLowerCase()) !== -1);
+  if(!key) return '未找到匹配账号（已采集的数据：' + (Object.keys(sd).join('、') || '无') + '）';
+  const rec = sd[key]; const zs = (rec.zones||[]).slice(0,10);
+  const L = ['🌐 ' + maskEmail(key) + ' Zones Top'];
+  if(!zs.length){ L.push('该账号无 zones 数据'); return L.join('\n'); }
+  zs.forEach((z,i) => L.push((i+1) + '. ' + z.name + '  ' + fmtNum(z.req) + ' req · ' + fmtBytesB(z.bytes)));
+  return L.join('\n');
+}
+async function tgOauthStatus(env){
+  const cl = await getOAuthClient(env);
+  if(!cl) return 'OAuth 未配置：请到面板「设置 → OAuth 免密钥接入」保存 Client 后授权。\n当前账号仍可用 Global Key 管理。';
+  const accs = await loadKVAccounts(env).catch(()=>[]);
+  const conns = accs.filter(a => a && a.oauth);
+  const L = ['🔐 OAuth 连接状态'];
+  L.push('Client ID: ' + cl.clientId.slice(0, 8) + '…（' + (cl.authMethod || 'post') + '）');
+  if(!conns.length) L.push('已配置但未授权任何账号：去面板设置页点「前往 Cloudflare 授权」');
+  conns.forEach(a => L.push('· ' + (a.name || a.email || a.oauthId) + (a.key ? '（Key+OAuth）' : '') + (a.scope ? ' [' + String(a.scope).slice(0,40) + ']' : '')));
+  return L.join('\n');
+}
+// ---- 流量突增/归零检测（运行于 4h 探活周期；与自积累的 an_daily 前 7 天对比）----
+async function checkTrafficAlerts(env){
+  const cfg = await getTGConfig(env);
+  if(!cfg.enabled || !cfg.alerts || cfg.alertsTraffic === false) return;
+  if(!(await notifReady(env))) return;
+  let snap = null; try { const r = await kvGet(env,'an_snap'); if(r) snap = JSON.parse(r); } catch(e){}
+  if(!snap || !snap.data) return;
+  let daily = {}; try { const r = await kvGet(env,'an_daily'); if(r) daily = JSON.parse(r)||{}; } catch(e){}
+  let sent = {}; try { const r = await kvGet(env,'al_traffic'); if(r) sent = JSON.parse(r)||{}; } catch(e){}
+  const today = new Date().toISOString().slice(0,10);
+  const dates = Object.keys(daily).sort().slice(-8, -1); // 不含今天的既往日
+  const avgOf = (email) => {
+    let sum = 0, n = 0;
+    for(const d of dates){ const row = daily[d] && daily[d][email]; if(row && row.req){ sum += row.req; n++; } }
+    return n ? sum / n : 0;
+  };
+  const spikes = [];
+  for(const k of Object.keys(snap.data)){
+    const r = snap.data[k];
+    const req = r.req || 0;
+    const avg = avgOf(k);
+    if(sent[k] === today) continue;
+    if(avg >= 10000 && req >= avg * 2 && req >= 20000){
+      spikes.push({ email:k, type:'spike', req, avg, bytes:r.bytes||0 });
+      sent[k] = today;
+    } else if(avg >= 10000 && req === 0){
+      spikes.push({ email:k, type:'zero', req, avg });
+      sent[k] = today;
+    }
+  }
+  if(spikes.length){
+    const L = [];
+    for(const s of spikes){
+      if(s.type === 'spike') L.push('📈 流量突增：' + maskEmail(s.email) + '\n   24h 请求 ' + fmtNum(s.req) + '（近 7 日日均 ' + fmtNum(s.avg) + '，' + Math.round((s.req/s.avg)*100) + '%）\n   流量 ' + fmtBytesB(s.bytes));
+      else L.push('🛑 流量归零：' + maskEmail(s.email) + '\n   近 7 日日均 ' + fmtNum(s.avg) + '，最新采集为 0 —— 请检查域名/限流/账号状态');
+    }
+    await kvPut(env, 'al_traffic', sent);
+    const msg = L.join('\n\n');
+    await sendTelegram(env, msg, '流量告警');
+  } else if(Object.keys(sent).length || Object.keys(snap.data).length){
+    await kvPut(env, 'al_traffic', sent);
+  }
 }
 function buildQuotaAlert(u, tier){
   const masked = maskEmail(u.email);
@@ -1791,17 +1956,19 @@ async function pushDailyReport(env, force = false){
   if(!creds.length) return { ok:false, error:'KV 中无账号' };
   const results = [];
   for(const c of creds){
-    try { const list = await queryAllUsageForCred(env, c); results.push(...list); }
-    catch(e){ results.push({ email:c.email, error:String(e) }); }
+    const label = c.email || c.name || '';
+    try { const list = await queryAllUsageForCred(env, c); for(const u of list){ u.email = u.email || label; results.push(u); } }
+    catch(e){ results.push({ email: label, error:String(e) }); }
   }
   const dateStr = new Date().toISOString().slice(0,10);
-  let msg = buildDailyReport(results, dateStr);
-  // P1-C: 头部标出异常/封号账号，便于一眼发现
-  const accounts = await loadKVAccounts(env);
-  const abnormal = accounts.filter(a=>a.status && a.status!=='ok');
-  if(abnormal.length){
-    msg = buildAbnormalMsg(abnormal.map(a=>({ email:a.email, status:a.status, reason:a.statusReason||a.status }))) + '\n\n' + msg;
-  }
+  // 收集健康/流量上下文（读 KV，不外发请求）
+  const ctx = { snapData: {}, abnormal: [], certs: [], probes: [], waf: [] };
+  try { const r = await kvGet(env,'an_snap'); if(r){ const s = JSON.parse(r); ctx.snapData = (s && s.data) || {}; } } catch(e){}
+  try { const r = await kvGet(env,'cert_expiry'); if(r) ctx.certs = JSON.parse(r)||[]; } catch(e){}
+  try { const r = await kvGet(env,'health_probe'); if(r) ctx.probes = JSON.parse(r)||[]; } catch(e){}
+  try { const r = await kvGet(env,'waf_status'); if(r) ctx.waf = JSON.parse(r)||[]; } catch(e){}
+  ctx.abnormal = creds.filter(a=>a.status && a.status!=='ok').map(a=>({ email: a.email || a.name || '', status:a.status, reason:a.statusReason||a.status }));
+  let msg = buildDailyReport(results, dateStr, ctx);
   return await sendTelegram(env, msg);
 }
 async function checkQuotaAlerts(env){
@@ -2204,6 +2371,7 @@ async function runProbeMonitoring(env){
   if(cfg.enabled && cfg.alerts && await notifReady(env)){ const sp = waf.filter(w=>w.blocked>=50000); if(sp.length) await sendTelegram(env, buildWafMsg(sp)); }
   await checkQuotaAlerts(env);
   await storeAnalytics(env).catch(()=>{});
+  await checkTrafficAlerts(env).catch(()=>{});
   try { const r = await kvGet(env,'tg_cron_heartbeat'); if(r){ const h = JSON.parse(r); if(!h.warned && Date.now()-h.last > 26*3600*1000){ await sendTelegram(env, '⏰ Cron 心跳异常：日报 cron 已超过 26 小时未运行，可能已被 CF 静默停止，请检查触发器配置。'); await kvPut(env,'tg_cron_heartbeat', Object.assign(h,{warned:true})); } } } catch(e){}
   await cleanupKV(env);
 }
@@ -3086,6 +3254,7 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <label><input type="checkbox" id="tgEnabled" checked> 启用推送</label>
         <label><input type="checkbox" id="tgDaily" checked> 每日日报</label>
         <label><input type="checkbox" id="tgAlerts" checked> 配额告警(50/80/95%)</label>
+        <label><input type="checkbox" id="tgTraffic" checked> 流量突增/归零告警</label>
       </div>
       <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn primary" onclick="saveTGConfig()">保存配置</button>
@@ -4314,7 +4483,7 @@ function renderStaticJS(env) {
       try { const r = await api('load-tg-config', {}); if (r && r.success && r.config) {
         if (r.config.botTokenSet) el('tgBotToken').placeholder = '已保存 (' + r.config.botToken + ')';
         if (r.config.chatId) el('tgChatId').value = r.config.chatId;
-        el('tgEnabled').checked = r.config.enabled !== false; el('tgDaily').checked = r.config.dailyReport !== false; el('tgAlerts').checked = r.config.alerts !== false;
+        el('tgEnabled').checked = r.config.enabled !== false; el('tgDaily').checked = r.config.dailyReport !== false; el('tgAlerts').checked = r.config.alerts !== false; if (el('tgTraffic')) el('tgTraffic').checked = r.config.alertsTraffic !== false;
       } } catch(e){}
       try { const r = await api('load-notify-config', {}); if (r && r.success && r.config) { fillNotifyConfig(r.config); } } catch(e){}
     }
@@ -5692,7 +5861,8 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
         chatId: el('tgChatId').value.trim(),
         enabled: el('tgEnabled').checked,
         dailyReport: el('tgDaily').checked,
-        alerts: el('tgAlerts').checked
+        alerts: el('tgAlerts').checked,
+        alertsTraffic: !el('tgTraffic') || el('tgTraffic').checked
       };
       const r = await api('save-tg-config', { config });
       if(r && r.success) showNotification('TG 配置已保存'); else showNotification((r&&r.error)||'保存失败','error');
