@@ -37,6 +37,13 @@ addEventListener('fetch', (event) => {
 });
 
 const CF_API_BASE = 'https://api.cloudflare.com/client/v4';
+// ---- OAuth 2.0（自服务 client：dash → Manage Account → OAuth clients）----
+const CF_OAUTH_AUTH = 'https://dash.cloudflare.com/oauth2/auth';
+const CF_OAUTH_TOKEN = 'https://dash.cloudflare.com/oauth2/token';
+const OAUTH_CLIENT_KV = 'oauth_client';
+function randHex(n){ const b = crypto.getRandomValues(new Uint8Array(n)); let s=''; for(let i=0;i<b.length;i++) s += b[i].toString(16).padStart(2,'0'); return s; }
+// OAuth token 注入密钥前缀：cfHeaders 识别后改用 Authorization: Bearer
+const OAUTH_KEY_PREFIX = '__oa_';
 
 // ---------------- 边缘缓存（降低 Cloudflare API 调用频率，规避限流） ----------------
 // 用 Cache API 在边缘缓存只读 GET 响应：跨 isolate / 区域命中，且不消耗 KV 写入额度（免费版仅 1000 写/日）。
@@ -46,7 +53,7 @@ const _apiCache = caches.default;
 const API_CACHE_TTL = 30;     // 秒；与个人面板刷新频率匹配，写操作后最多 30s 可见新数据
 async function _apiCacheGet(url, email, key) {
   try {
-    const req = new Request(url, { method: 'GET', headers: { 'X-Auth-Email': email, 'X-Auth-Key': key } });
+    const req = new Request(url, { method: 'GET', headers: cfHeaders(email, key) });
     const res = await _apiCache.match(req);
     if (!res) return null;
     return await res.json();
@@ -54,7 +61,7 @@ async function _apiCacheGet(url, email, key) {
 }
 async function _apiCachePut(url, email, key, data) {
   try {
-    const req = new Request(url, { method: 'GET', headers: { 'X-Auth-Email': email, 'X-Auth-Key': key } });
+    const req = new Request(url, { method: 'GET', headers: cfHeaders(email, key) });
     const res = new Response(JSON.stringify(data), { status: 200, headers: { 'content-type': 'application/json', 'Cache-Control': 'max-age=' + API_CACHE_TTL } });
     const p = _apiCache.put(req, res);
     if (_ctxWaitUntil) _ctxWaitUntil(p); else await p;
@@ -105,6 +112,10 @@ async function handleRequest(request, env, ctx) {
   if (p === '/telegram' && request.method === 'POST') {
     return handleTelegramWebhook(request, env);
   }
+
+  // OAuth 2.0 授权流程（start 302 到 dash；callback 由 CF 跳回，二者均公开、依赖 state 校验）
+  if (request.method === 'GET' && p === '/oauth/start') return handleOAuthStart(env, url);
+  if (request.method === 'GET' && p === '/oauth/callback') return handleOAuthCallback(env, url);
 
   // session 校验（仅在设置了 ACCESS_PASSWORD 时生效）
   if (hasPassword) {
@@ -187,8 +198,25 @@ async function handleAPI(req, env) {
     'get-worker-domains','toggle-worker-subdomain','add-worker-domain', 'delete-worker-domain', 'get-worker-bindings','list-pages-projects','delete-pages-project','deploy-pages-direct','list-snippets','get-snippet','deploy-snippet','delete-snippet','list-snippet-rules','add-snippet-rule','delete-snippet-rule'
   ]);
 
+  // 资源类 action 的 OAuth 会话解析：前端仅提交 oauthId，后端解密 token 注入为 Bearer（key=__oa_+token）
   if (needsCreds.has(action)) {
-    if (!payload.email || !payload.key) return json({ success:false, error:'email & key required' }, 400);
+    if (payload.oauthId && !(payload.key && payload.key.startsWith(OAUTH_KEY_PREFIX))) {
+      try {
+        const oaAccs = await loadKVAccounts(env);
+        const oaAcc = oaAccs.find(a => a && a.oauth && a.oauthId === payload.oauthId);
+        if (!oaAcc) return json({ success: false, error: 'OAuth 连接不存在或已断开，请在账号库重新授权' }, 401);
+        if (oaAcc.expiresAt && Date.now() > oaAcc.expiresAt - 60000 && oaAcc.refreshToken) {
+          await refreshOAuthToken(env, oaAcc);
+          const fresh = (await loadKVAccounts(env)).find(a => a && a.oauth && a.oauthId === payload.oauthId);
+          if (fresh && fresh.accessToken) { oaAcc.accessToken = fresh.accessToken; oaAcc.refreshToken = fresh.refreshToken; oaAcc.expiresAt = fresh.expiresAt; }
+        }
+        if (!oaAcc.accessToken) return json({ success: false, error: 'OAuth token 缺失，请重新授权' }, 401);
+        payload.email = oaAcc.email || oaAcc.name || '';
+        payload.key = OAUTH_KEY_PREFIX + oaAcc.accessToken;
+      } catch(e){ return json({ success: false, error: 'OAuth 会话解析失败：' + e.message }, 500); }
+    }
+    const isOa = typeof payload.key === 'string' && payload.key.startsWith(OAUTH_KEY_PREFIX);
+    if (!payload.key || (!isOa && !payload.email)) return json({ success:false, error:'email & key required' }, 400);
   }
 
   try {
@@ -341,7 +369,7 @@ async function handleAPI(req, env) {
         }
 
         const uploadUrl = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`;
-        let resp = await fetch(uploadUrl, { method:'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
+        let resp = await fetch(uploadUrl, { method:'PUT', headers:cfHeaders(payload.email, payload.key), body: form });
         
         let text = "";
         try { text = await resp.text(); } catch(e) { text = "{}"; }
@@ -359,7 +387,7 @@ async function handleAPI(req, env) {
           } else {
             retryForm.append('script', new Blob([finalScript], { type:'application/javascript' }), 'worker.js');
           }
-          resp = await fetch(uploadUrl, { method:'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: retryForm });
+          resp = await fetch(uploadUrl, { method:'PUT', headers:cfHeaders(payload.email, payload.key), body: retryForm });
           try { text = await resp.text(); } catch(e) { text = "{}"; }
           try { uploadRes = JSON.parse(text); } catch { uploadRes = { errors: [{ message: text }] }; }
           autoDowngraded = true;
@@ -419,7 +447,7 @@ async function handleAPI(req, env) {
             form.append('script', new Blob([currentScript], { type:'application/javascript' }), 'worker.js');
         }
         
-        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`, { method: 'PUT', headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
+        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}`, { method: 'PUT', headers: cfHeaders(payload.email, payload.key), body: form });
         return json({ success: r.ok, message: r.ok?'Saved':'Failed', details: await r.text() });
       }
 
@@ -432,7 +460,7 @@ async function handleAPI(req, env) {
         return json({ success: true, result: { vars } });
       }
       
-      case 'get-worker-analytics': { const { scriptName } = payload; if (!scriptName || !payload.accountId) return json({ success:false },400); const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/analytics/summary`, { headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } }); if (r.ok) return json({ success: true, data: (await r.json()).result || {} }); return json({ success: false, error: 'Error' }); }
+      case 'get-worker-analytics': { const { scriptName } = payload; if (!scriptName || !payload.accountId) return json({ success:false },400); const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(scriptName)}/analytics/summary`, { headers: cfHeaders(payload.email, payload.key) }); if (r.ok) return json({ success: true, data: (await r.json()).result || {} }); return json({ success: false, error: 'Error' }); }
       
       case 'get-usage-today': { 
         if (!payload.accountId) return json({ success:false },400); 
@@ -442,7 +470,7 @@ async function handleAPI(req, env) {
         now.setUTCHours(0,0,0,0); 
         const start=now.toISOString(); 
         try { 
-          const r=await fetch("https://api.cloudflare.com/client/v4/graphql",{method:"POST",headers:{"Content-Type":"application/json","X-Auth-Email":email,"X-Auth-Key":apikey},body:JSON.stringify({query:`query getBillingMetrics($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){sum{requests}}}}}`,variables:{accountId,filter:{datetime_geq:start,datetime_leq:end}}})}); 
+          const r=await fetch("https://api.cloudflare.com/client/v4/graphql",{method:"POST",headers:Object.assign({ "Content-Type":"application/json" }, cfHeaders(email, apikey)),body:JSON.stringify({query:`query getBillingMetrics($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){sum{requests}}}}}`,variables:{accountId,filter:{datetime_geq:start,datetime_leq:end}}})}); 
           if(!r.ok) return json({success:true,data:{total:0,workers:0,pages:0,percentage:0}}); 
           const res=await r.json(); 
           const ac=res?.data?.viewer?.accounts?.[0]; 
@@ -592,7 +620,7 @@ case 'deploy-pages-direct': {
     }
   }
 
-  const deployRes = await fetch(CF_API_BASE + '/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName) + '/deployments', { method:'POST', headers:{ 'X-Auth-Email':payload.email, 'X-Auth-Key':payload.key }, body:form });
+  const deployRes = await fetch(CF_API_BASE + '/accounts/' + accountId + '/pages/projects/' + encodeURIComponent(projectName) + '/deployments', { method:'POST', headers:cfHeaders(payload.email, payload.key), body:form });
   let deploy; try { deploy = await deployRes.json(); } catch(e) { deploy = { success:deployRes.ok }; }
   if (!deployRes.ok || deploy.success === false) return json({ success:false, step:'create-deployment', error:(deploy.errors && deploy.errors[0] && deploy.errors[0].message) || '创建部署失败' }, 200);
   const result = deploy.result || {};
@@ -603,8 +631,8 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       case 'create-kv-namespace': return json(await cfPost(`/accounts/${payload.accountId}/storage/kv/namespaces`, payload.email, payload.key, { title: payload.title }));
       case 'delete-kv-namespace': return json(await cfDelete(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}`, payload.email, payload.key));
       case 'list-kv-keys': return json(await cfGet(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/keys`, payload.email, payload.key));
-      case 'get-kv-value': { const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }}); return json({ success: r.ok, value: await r.text() }); }
-      case 'put-kv-value': { const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { method: 'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: payload.value }); return json({ success: r.ok }); }
+      case 'get-kv-value': { const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { headers:cfHeaders(payload.email, payload.key)}); return json({ success: r.ok, value: await r.text() }); }
+      case 'put-kv-value': { const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, { method: 'PUT', headers:cfHeaders(payload.email, payload.key), body: payload.value }); return json({ success: r.ok }); }
       case 'delete-kv-value': return json(await cfDelete(`/accounts/${payload.accountId}/storage/kv/namespaces/${payload.namespaceId}/values/${encodeURIComponent(payload.key)}`, payload.email, payload.key));
 
       case 'list-d1': return json(await cfGet(`/accounts/${payload.accountId || await getAccountId(payload.email, payload.key)}/d1/database`, payload.email, payload.key));
@@ -635,7 +663,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       }
       case 'delete-worker-domain': {
         const url = `${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}/domains/${payload.domainId}`;
-        const r = await fetch(url, { method: 'DELETE', headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } });
+        const r = await fetch(url, { method: 'DELETE', headers: cfHeaders(payload.email, payload.key) });
         return json({ success: r.ok });
       }
       
@@ -651,7 +679,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         const { zoneId, snippetName } = payload;
         if (!zoneId || !snippetName) return json({ success: false, error: 'zoneId & snippetName required' }, 400);
         const metaRes = await cfGet(`/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}`, payload.email, payload.key);
-        const contentResp = await fetch(`${CF_API_BASE}/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}/content`, { headers: { 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } });
+        const contentResp = await fetch(`${CF_API_BASE}/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}/content`, { headers: cfHeaders(payload.email, payload.key) });
         let snippetCode = '';
         if (contentResp.ok) { try { snippetCode = await contentResp.text(); } catch(e) {} }
         return json({ success: true, metadata: metaRes.result || {}, code: snippetCode });
@@ -668,7 +696,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         form.append('main.js', new Blob([finalCode], { type:'application/javascript+module' }), 'main.js');
         
         const uploadUrl = `${CF_API_BASE}/zones/${zoneId}/snippets/${encodeURIComponent(snippetName)}`;
-        const resp = await fetch(uploadUrl, { method:'PUT', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key }, body: form });
+        const resp = await fetch(uploadUrl, { method:'PUT', headers:cfHeaders(payload.email, payload.key), body: form });
         
         let text = ""; try { text = await resp.text(); } catch(e) { text = "{}"; }
         let uploadRes; try { uploadRes = JSON.parse(text); } catch { uploadRes = { errors: [{ message: text }] }; }
@@ -728,7 +756,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       }
 
       case 'delete-worker': {
-        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}`, { method:'DELETE', headers:{ 'X-Auth-Email': payload.email, 'X-Auth-Key': payload.key } });
+        const r = await fetch(`${CF_API_BASE}/accounts/${payload.accountId}/workers/scripts/${encodeURIComponent(payload.scriptName)}`, { method:'DELETE', headers:cfHeaders(payload.email, payload.key) });
         return json({ success: r.ok });
       }
 
@@ -740,17 +768,72 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定，请在 Worker 绑定设置中添加 KV 命名空间并变量名设为 CF_ACCOUNTS_KV' });
         const { accounts } = payload;
         if (!Array.isArray(accounts)) return json({ success: false, error: 'accounts 必须是数组' });
-        const key = await getCryptoKey(env);
-        const toStore = [];
-        for (const a of accounts) { toStore.push(key ? await encJSON(a, key) : a); }
-        await env.CF_ACCOUNTS_KV.put('accounts', JSON.stringify(toStore));
-        return json({ success: true, encrypted: !!key });
+        // oauth 账号仅合并非 token 字段（token 只经授权回调写入 KV，前端不可见、不可覆盖）
+        const prev = await loadKVAccounts(env).catch(() => []);
+        const merged = [];
+        for (const sub of accounts) {
+          if (sub && sub.oauth) {
+            const old = prev.find(p => p && p.oauth && p.oauthId === sub.oauthId);
+            if (!old) continue; // 新 oauth 记录只能由 /oauth/callback 创建
+            merged.push(Object.assign({}, old, sub, { accessToken: old.accessToken, refreshToken: old.refreshToken, expiresAt: old.expiresAt, accountId: old.accountId, accountIds: old.accountIds }));
+          } else merged.push(sub);
+        }
+        await persistAccountsEnc(env, merged);
+        return json({ success: true, encrypted: !!(await getCryptoKey(env)) });
       }
 
       case 'load-accounts-kv': {
         if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
         const accounts = await loadKVAccounts(env);
-        return json({ success: true, accounts });
+        // oauth token 绝不回传前端
+        const sanitized = accounts.map(a => (a && a.oauth) ? Object.assign({}, a, { accessToken: '', refreshToken: '', key: '' }) : a);
+        return json({ success: true, accounts: sanitized });
+      }
+
+      case 'save-oauth-client': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
+        const clientId = String(payload.clientId || '').trim();
+        if (!clientId) return json({ success: false, error: 'Client ID 必填' });
+        const cur = await getOAuthClient(env) || {};
+        const next = { clientId, authMethod: payload.authMethod || cur.authMethod || 'post' };
+        if (payload.clientSecret) next.clientSecret = String(payload.clientSecret).trim();
+        else if (cur.clientSecret) next.clientSecret = cur.clientSecret;
+        if (payload.scopes) next.scopes = String(payload.scopes);
+        else if (cur.scopes) next.scopes = cur.scopes;
+        await saveOAuthClient(env, next);
+        return json({ success: true });
+      }
+
+      case 'load-oauth-client': {
+        const cl = await getOAuthClient(env);
+        if (!cl) return json({ success: true, configured: false, connections: [] });
+        const accs = await loadKVAccounts(env).catch(() => []);
+        const connections = accs.filter(a => a && a.oauth).map(a => ({
+          oauthId: a.oauthId, name: a.name || a.email || a.oauthId, email: a.email || '',
+          scope: a.scope || '', added: a.added || '', accountId: a.accountId || '',
+          group: a.group || '', status: a.status || 'ok', statusReason: a.statusReason || ''
+        }));
+        return json({ success: true, configured: true, clientId: cl.clientId, hasSecret: !!cl.clientSecret, authMethod: cl.authMethod || 'post', connections });
+      }
+
+      case 'oauth-begin': {
+        const cl = await getOAuthClient(env);
+        if (!cl || !cl.clientId) return json({ success: false, error: '请先在「OAuth 免密钥接入」保存 Client ID / Secret' });
+        const origin = new URL(req.url).origin;
+        const state = randHex(16);
+        if (env && env.CF_ACCOUNTS_KV) await env.CF_ACCOUNTS_KV.put('oauth_state_' + state, cl.clientId, { expirationTtl: 600 });
+        const q = new URLSearchParams({ client_id: cl.clientId, response_type: 'code', redirect_uri: origin + '/oauth/callback', state });
+        return json({ success: true, url: CF_OAUTH_AUTH + '?' + q.toString() });
+      }
+
+      case 'oauth-revoke-account': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
+        const oauthId = payload.oauthId;
+        if (!oauthId) return json({ success: false, error: 'oauthId required' }, 400);
+        const arr = await loadKVAccounts(env);
+        const next = arr.filter(a => !(a && a.oauth && a.oauthId === oauthId));
+        await persistAccountsEnc(env, next);
+        return json({ success: true });
       }
 
       case 'save-tg-config': {
@@ -988,6 +1071,113 @@ async function loadKVAccounts(env){
   for(const a of arr){ if(a && a.__enc){ const d = await decJSON(a, key); if(d) out.push(d); } else out.push(a); }
   return out;
 }
+// ============ OAuth 2.0 免密钥接入（Authorization Code + client_secret）============
+// 前置：dash → Manage Account → OAuth clients 自建 client（redirect: <本面板>/oauth/callback）
+async function getOAuthClient(env){
+  if (!env || !env.CF_ACCOUNTS_KV) return null;
+  const raw = await env.CF_ACCOUNTS_KV.get(OAUTH_CLIENT_KV);
+  if (!raw) return null;
+  let cl; try { cl = JSON.parse(raw); } catch(e){ return null; }
+  const key = await getCryptoKey(env);
+  if (key && cl && cl.__enc) { const d = await decJSON(cl, key); if (d) cl = d; }
+  return (cl && cl.clientId) ? cl : null;
+}
+async function saveOAuthClient(env, client){
+  if (!env || !env.CF_ACCOUNTS_KV) return;
+  const key = await getCryptoKey(env);
+  await env.CF_ACCOUNTS_KV.put(OAUTH_CLIENT_KV, JSON.stringify(key ? await encJSON(client, key) : client));
+}
+// token 端点调用：authMethod = post(默认,secret 放 body) | basic(Authorization Basic) | none(PKCE)
+async function oauthTokenFetch(cl, params){
+  const body = new URLSearchParams(Object.assign({ client_id: cl.clientId }, params));
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  const am = cl.authMethod || 'post';
+  if (am === 'basic') headers['Authorization'] = 'Basic ' + btoa(cl.clientId + ':' + (cl.clientSecret || ''));
+  else if (am !== 'none' && cl.clientSecret) body.set('client_secret', cl.clientSecret);
+  const r = await fetch(CF_OAUTH_TOKEN, { method:'POST', headers, body: body.toString() });
+  if (!r.ok) { const t = await r.text().catch(()=>''); const e = new Error('token HTTP ' + r.status + ' ' + t.slice(0,160)); e.status = r.status; throw e; }
+  return r.json();
+}
+async function persistAccountsEnc(env, arr){
+  if (!env || !env.CF_ACCOUNTS_KV) return;
+  const key = await getCryptoKey(env);
+  const toStore = [];
+  for (const a of arr) toStore.push(key ? await encJSON(a, key) : a);
+  await env.CF_ACCOUNTS_KV.put('accounts', JSON.stringify(toStore));
+}
+// 同 accountId 已有 oauth 连接则原位更新（保留 oauthId，前端选择不失效）；否则新增
+async function upsertOAuthAccount(env, acc){
+  const arr = await loadKVAccounts(env);
+  const i = arr.findIndex(a => a && a.oauth && acc.accountId && a.accountId === acc.accountId);
+  let out;
+  if (i !== -1) { const old = arr[i]; out = Object.assign({}, old, acc, { oauthId: old.oauthId || acc.oauthId }); arr[i] = out; }
+  else { out = acc; arr.unshift(acc); }
+  await persistAccountsEnc(env, arr);
+  return out;
+}
+async function refreshOAuthToken(env, acc){
+  try {
+    const cl = await getOAuthClient(env);
+    if (!cl || !cl.clientId || !acc || !acc.refreshToken) return null;
+    const j = await oauthTokenFetch(cl, { grant_type: 'refresh_token', refresh_token: acc.refreshToken });
+    if (!j || !j.access_token) return null;
+    const exp = (j.expires_in && Number(j.expires_in)) || 3600;
+    acc.accessToken = j.access_token;
+    if (j.refresh_token) acc.refreshToken = j.refresh_token;
+    acc.expiresAt = Date.now() + exp * 1000;
+    await upsertOAuthAccount(env, acc);
+    return acc;
+  } catch(e){ return null; }
+}
+async function handleOAuthStart(env, url){
+  const html = (msg, ok) => new Response('<!doctype html><html><head><meta charset="utf-8"><title>OAuth</title></head><body style="font-family:system-ui,sans-serif;background:#f1f5f9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="background:#fff;border-radius:16px;padding:32px 40px;max-width:520px;box-shadow:0 10px 30px rgba(2,6,23,.08);text-align:center"><div style="font-size:44px;margin-bottom:12px">' + (ok ? '🔐' : '⚠️') + '</div><h2 style="margin:0 0 10px;color:#0f172a">' + (ok ? '正在前往 Cloudflare 授权…' : 'OAuth 无法启动') + '</h2><p style="color:#64748b;line-height:1.7">' + msg + '</p><p style="margin-top:18px"><a href="/settings" style="color:#1d4ed8">← 返回设置</a></p></div></body></html>', { headers: { 'content-type': 'text/html; charset=utf-8' } });
+  const cl = await getOAuthClient(env);
+  if (!cl || !cl.clientId) return html('请先在面板「设置 → OAuth 免密钥接入」保存 <b>Client ID</b> 与 <b>Client Secret</b>。', false);
+  const state = randHex(16);
+  if (env && env.CF_ACCOUNTS_KV) await env.CF_ACCOUNTS_KV.put('oauth_state_' + state, cl.clientId, { expirationTtl: 600 });
+  const q = new URLSearchParams({ client_id: cl.clientId, response_type: 'code', redirect_uri: url.origin + '/oauth/callback', state });
+  return Response.redirect(CF_OAUTH_AUTH + '?' + q.toString(), 302);
+}
+async function handleOAuthCallback(env, url){
+  const errRedirect = (msg) => Response.redirect(url.origin + '/login?oauth_error=' + encodeURIComponent(msg), 302);
+  const code = url.searchParams.get('code'), state = url.searchParams.get('state');
+  if (!code || !state) return errRedirect('回调缺少 code 或 state');
+  if (!env || !env.CF_ACCOUNTS_KV) return errRedirect('CF_ACCOUNTS_KV 未绑定');
+  const cl = await getOAuthClient(env);
+  if (!cl || !cl.clientId) return errRedirect('OAuth client 未配置');
+  const stKey = 'oauth_state_' + state;
+  const stored = await env.CF_ACCOUNTS_KV.get(stKey);
+  if (!stored || stored !== cl.clientId) return errRedirect('state 校验失败，请重新发起授权');
+  await env.CF_ACCOUNTS_KV.delete(stKey);
+  try {
+    const j = await oauthTokenFetch(cl, { grant_type: 'authorization_code', code, redirect_uri: url.origin + '/oauth/callback' });
+    if (!j || !j.access_token) return errRedirect('换取 token 失败' + (j && j.error ? '：' + j.error : ''));
+    const hdr = { Authorization: 'Bearer ' + j.access_token };
+    let email = '', accounts = [];
+    try { const u = await (await fetch(CF_API_BASE + '/user', { headers: hdr })).json(); if (u && u.result && u.result.email) email = u.result.email; } catch(e){}
+    try { const a = await (await fetch(CF_API_BASE + '/accounts', { headers: hdr })).json(); if (a && Array.isArray(a.result)) accounts = a.result; } catch(e){}
+    const acc0 = accounts[0] || {};
+    const expiresIn = (j.expires_in && Number(j.expires_in)) || 3600;
+    const acc = {
+      oauth: true,
+      oauthId: 'oau_' + randHex(6),
+      name: acc0.name || email || 'Cloudflare OAuth',
+      email: email || '',
+      key: '',                       // oauth 账号不使用 Global Key
+      accountId: acc0.id || '',
+      accountIds: (accounts || []).map(x => x.id),
+      scope: String(j.scope || '').slice(0, 300),
+      accessToken: j.access_token,
+      refreshToken: j.refresh_token || '',
+      expiresAt: Date.now() + expiresIn * 1000,
+      added: new Date().toISOString().slice(0, 10),
+      status: 'ok'
+    };
+    await upsertOAuthAccount(env, acc);
+    return Response.redirect(url.origin + '/workers?oauth=ok', 302);
+  } catch(e){ return errRedirect('OAuth 完成失败：' + e.message); }
+}
+
 async function getTGConfig(env){
   let botToken = env && env.TG_BOT_TOKEN;
   let chatId = env && env.TG_CHAT_ID;
@@ -1202,7 +1392,7 @@ async function queryUsageByAccountId(email, key, accountId){
   now.setUTCHours(0,0,0,0);
   const start = now.toISOString();
   const r = await fetch('https://api.cloudflare.com/client/v4/graphql', {
-    method:'POST', headers:{'Content-Type':'application/json','X-Auth-Email':email,'X-Auth-Key':key},
+    method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)),
     body: JSON.stringify({ query: TG_USAGE_QUERY, variables:{ accountId, filter:{ datetime_geq:start, datetime_leq:end } } })
   });
   if(!r.ok) return { total:0, workers:0, pages:0, percent:0, byScript:[], error:true };
@@ -1448,7 +1638,7 @@ async function queryStorageUsage(env){
       for(const a of (ar.result||[])){
         let d1Count=0; try { const r = await cfGet('/accounts/'+a.id+'/d1/database', c.email, c.key); d1Count = (r.success&&r.result)?r.result.length:0; } catch(e){}
         let r2Ops=0, kvOps=0;
-        try { const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:{'Content-Type':'application/json','X-Auth-Email':c.email,'X-Auth-Key':c.key}, body: JSON.stringify({ query: STORAGE_QUERY, variables:{ accountId:a.id } }) }); const res = await g.json(); const vr = res?.data?.viewer?.accounts?.[0]; r2Ops = vr?.r2AggregateAnalytics?.[0]?.sum?.requests||0; kvOps = vr?.kvOperationsAdaptive?.[0]?.sum?.requests||0; } catch(e){}
+        try { const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, c.key)), body: JSON.stringify({ query: STORAGE_QUERY, variables:{ accountId:a.id } }) }); const res = await g.json(); const vr = res?.data?.viewer?.accounts?.[0]; r2Ops = vr?.r2AggregateAnalytics?.[0]?.sum?.requests||0; kvOps = vr?.kvOperationsAdaptive?.[0]?.sum?.requests||0; } catch(e){}
         out.push({ email:c.email, accountId:a.id, name:a.name, d1Count, r2Ops, kvOps });
       }
     } catch(e){ out.push({ email:c.email, error:String(e) }); }
@@ -1523,7 +1713,7 @@ async function checkWaf(env){
         try {
           const end = new Date().toISOString(); const start = new Date(Date.now()-86400000).toISOString();
           const q = `query W($zone:String!,$f:ZoneFirewallEventsFilter_InputObject){viewer{zones(filter:{zoneTag:$zone}){firewallEventsAdaptiveGroups(limit:1,filter:$f){sum{requests}}}}}`;
-          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:{'Content-Type':'application/json','X-Auth-Email':c.email,'X-Auth-Key':c.key}, body: JSON.stringify({ query:q, variables:{ zone:z.id, f:{ datetime_geq:start, datetime_leq:end } } }) });
+          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, c.key)), body: JSON.stringify({ query:q, variables:{ zone:z.id, f:{ datetime_geq:start, datetime_leq:end } } }) });
           const res = await g.json(); const cnt = res?.data?.viewer?.zones?.[0]?.firewallEventsAdaptiveGroups?.[0]?.sum?.requests || 0;
           out.push({ email:c.email, zone:z.name, blocked:cnt });
         } catch(e){}
@@ -1559,7 +1749,7 @@ async function deployWorkerTo(email, key, accountId, scriptName, scriptSource, m
   const form = new FormData();
   if(isModule){ metadata.main_module='worker.js'; form.append('metadata', JSON.stringify(metadata)); form.append('worker.js', new Blob([finalScript],{type:'application/javascript+module'}),'worker.js'); }
   else { metadata.body_part='script'; form.append('metadata', JSON.stringify(metadata)); form.append('script', new Blob([finalScript],{type:'application/javascript'}),'worker.js'); }
-  const resp = await fetch(`${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`, { method:'PUT', headers:{'X-Auth-Email':email,'X-Auth-Key':key}, body: form });
+  const resp = await fetch(`${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`, { method:'PUT', headers:cfHeaders(email, key), body: form });
   const text = await resp.text().catch(()=>'{}');
   let res; try { res = JSON.parse(text); } catch { res = { errors:[{message:text}] }; }
   return { success: resp.ok, message: resp.ok?'OK':(res.errors?.[0]?.message||'fail') };
@@ -1640,7 +1830,7 @@ async function getWorkerScriptInternal(email, key, accountId, scriptName) {
     if (!scriptName) return json({ success:false, error:'scriptName required' },400);
     const accId = accountId || await getAccountId(email, key);
     const url = `${CF_API_BASE}/accounts/${accId}/workers/scripts/${encodeURIComponent(scriptName)}`;
-    const resp = await fetch(url, { method:'GET', headers:{ 'X-Auth-Email': email, 'X-Auth-Key': key }});
+    const resp = await fetch(url, { method:'GET', headers:cfHeaders(email, key)});
     
     if (resp.status === 404) {
          return json({ ok: false, status: 404, rawScript: "export default { async fetch() { return new Response('New Worker'); } };" });
@@ -1707,6 +1897,12 @@ async function getAccountId(email, key) {
   throw new Error('Cannot find accountId');
 }
 
+// 统一鉴权头：OAuth（key=__oa_+token）走 Authorization Bearer；Global Key 走 X-Auth-Email/Key
+function cfHeaders(email, key){
+  if (key && typeof key === 'string' && key.startsWith(OAUTH_KEY_PREFIX)) return { Authorization: 'Bearer ' + key.slice(OAUTH_KEY_PREFIX.length) };
+  return { 'X-Auth-Email': email, 'X-Auth-Key': key };
+}
+
 async function cfGet(path, email, key) { return cfAny('GET', path, email, key); }
 async function cfPost(path, email, key, body) { return cfAny('POST', path, email, key, body); }
 async function cfPut(path, email, key, body) { return cfAny('PUT', path, email, key, body); }
@@ -1714,13 +1910,13 @@ async function cfDelete(path, email, key) { return cfAny('DELETE', path, email, 
 
 async function cfPutRaw(path, email, key, body) {
   const url = path.startsWith('http') ? path : CF_API_BASE + path;
-  const res = await fetch(url, { method:'PUT', headers: { 'X-Auth-Email': email, 'X-Auth-Key': key, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const res = await fetch(url, { method:'PUT', headers: Object.assign(cfHeaders(email, key), { 'Content-Type': 'application/json' }), body: JSON.stringify(body) });
   try { return await res.json(); } catch { return { success: res.ok }; }
 }
 
 async function cfAny(method, path, email, key, body = null) {
   const url = path.startsWith('http') ? path : CF_API_BASE + path;
-  const headers = { 'X-Auth-Email': email, 'X-Auth-Key': key };
+  const headers = cfHeaders(email, key);
   const opts = { method, headers };
   if (body !== null) {
     headers['Content-Type'] = 'application/json';
@@ -2423,6 +2619,31 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <div class="small" style="margin-top:8px;color:#b45309">注意：此为账户级设置，作用于当前「执行账号」的 workers.dev 子域名，需先在账号库选择执行账号。</div>
       </div>
 
+      <div class="card" style="margin-top:16px">
+        <h3 style="margin:0">OAuth 免密钥接入 <span style="font-weight:400;font-size:12px;color:#64748b">（替代 Global Key：最小权限 + 可随时撤销，无需粘贴密钥）</span></h3>
+        <div class="small" style="margin-top:6px;line-height:1.9">
+          ① 打开 Cloudflare <b>dash → Manage Account → OAuth clients</b> → Create client（需 Super Administrator / Administrator 角色）。<br>
+          ② Grant type 选 <b>authorization_code</b>；Token authentication 选 <b>Client secret (POST)</b> 或 Basic（选 none=PKCE 则无需 Secret）。<br>
+          ③ Redirect URL 填：<code id="oauthRedirectHint" style="background:#f1f5f9;padding:1px 6px;border-radius:4px"></code><br>
+          ④ 按需勾选 scope（命名与 API Token 权限一致，如 account:read、workers:read、zone:read…），保存后将 Client ID / Secret 填到下方保存，再点「前往 Cloudflare 授权」。<br>
+          <span style="color:#b45309">提示：client 设为 private 时仅创建账号的成员可授权；要给其他 CF 账号授权需先在 dash 把 client 改为 public（需域名 TXT 验证）。</span>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <input id="oauthClientId" class="input" style="flex:1;min-width:220px" placeholder="Client ID">
+          <input id="oauthClientSecret" class="input" style="flex:1;min-width:220px" placeholder="Client Secret（仅保存时填写）">
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <select id="oauthAuthMethod" class="input" style="width:auto">
+            <option value="post">Token 认证：client_secret_post</option>
+            <option value="basic">Token 认证：client_secret_basic</option>
+            <option value="none">Token 认证：none（PKCE，免 Secret）</option>
+          </select>
+          <button class="btn primary" onclick="saveOAuthConfig()">保存配置</button>
+          <button class="btn" onclick="oauthConnect()">前往 Cloudflare 授权</button>
+        </div>
+        <div id="oauthConnBox" class="small" style="margin-top:12px;white-space:pre-wrap;color:#475569"></div>
+      </div>
+
       <!-- 新增：Telegram 反馈加群按钮 -->
       <div class="card" style="margin-top:16px; display:flex; justify-content:center; padding:24px;">
         <a href="https://t.me/yifang_chat" target="_blank" style="text-decoration:none; text-align:center; color:#334155;">
@@ -2825,7 +3046,15 @@ function renderStaticJS(env) {
   return `(function(){
   function el(id){ return document.getElementById(id); }
   function safeParse(s){ try { return JSON.parse(s); } catch(e){ return null; } }
-  function getActiveCreds(){ return { email: localStorage.getItem('cf_active_email')||'', key: localStorage.getItem('cf_active_key')||'' }; }
+  function getActiveCreds(){
+    const oaId = localStorage.getItem('cf_active_oauth');
+    if (oaId) {
+      const arr = loadSaved();
+      const a = arr.find(x => x && x.oauth && x.oauthId === oaId);
+      if (a) return { email: a.email || a.name || oaId, key: '', oauthId: oaId, name: a.name || a.email || oaId };
+    }
+    return { email: localStorage.getItem('cf_active_email')||'', key: localStorage.getItem('cf_active_key')||'' };
+  }
   (async function(){ if(document.body.dataset.page==='login' && getActiveCreds().email){ try{ const r=await fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'check-features'})}); if(r.ok) location.replace('/workers'); }catch(e){} } })();
   
   function loadSaved(){ try { return JSON.parse(localStorage.getItem('cf_accounts')||'[]'); } catch(e){ return []; } }
@@ -2936,11 +3165,16 @@ function renderStaticJS(env) {
       arr.forEach((a, idx) => {
         const d = document.createElement('div');
         d.className = 'account-row';
-        d.innerHTML = '<div><div style="font-weight:600">'+a.email+'</div><div class="small">添加于 '+(a.added||'')+'</div></div><div><button class="btn" data-idx="'+idx+'">快速登录</button></div>';
+        if (a && a.oauth) {
+          d.innerHTML = '<div><div style="font-weight:600">' + (a.name || a.email || 'OAuth 连接') + ' <span class="badge">OAuth</span></div><div class="small">' + (a.scope || 'OAuth 授权连接') + '</div></div><div><button class="btn" data-oauth="1">授权管理</button></div>';
+        } else {
+          d.innerHTML = '<div><div style="font-weight:600">' + a.email + '</div><div class="small">添加于 ' + (a.added || '') + '</div></div><div><button class="btn" data-idx="' + idx + '">快速登录</button></div>';
+        }
         cont.appendChild(d);
       });
       Array.from(cont.querySelectorAll('button')).forEach(btn => {
-        btn.addEventListener('click', function(){ const idx = +this.dataset.idx; const arr = loadSaved(); if (!arr[idx]) return alert('账号不存在'); localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); location.replace('/workers'); });
+        if (btn.dataset.oauth) { btn.addEventListener('click', function(){ location.replace('/settings'); }); return; }
+        btn.addEventListener('click', function(){ const idx = +this.dataset.idx; const arr = loadSaved(); if (!arr[idx]) return alert('账号不存在'); localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); localStorage.removeItem('cf_active_oauth'); location.replace('/workers'); });
       });
     }
 
@@ -3053,6 +3287,8 @@ function renderStaticJS(env) {
         } else { sel.innerHTML = '<option value="">未在环境变量配置 BATCH_NAMES</option>'; }
     })();
 
+    function acctLabel(a){ return (a && a.oauth) ? (a.name || a.email || a.oauthId) : (a && a.email) ? a.email : '未命名'; }
+    function isActiveAccount(a, cur){ return (a && a.oauth) ? cur.oauthId === a.oauthId : cur.email === a.email; }
     function openAccountSwitcher() {
       const arr = loadSaved(); const current = getActiveCreds(); const cont = el('accountListContainer'); cont.innerHTML = '';
       if (arr.length === 0) {
@@ -3060,14 +3296,24 @@ function renderStaticJS(env) {
           '<div style="text-align:center;padding:0 16px 14px"><button class="btn small" onclick="goAccounts()">去账号库添加</button></div>';
       } else {
         arr.forEach((acc, idx) => {
-          const isActive = acc.email === current.email; const div = document.createElement('div'); div.className = 'acct-row ' + (isActive ? 'acct-active' : '');
-          div.innerHTML = \`<div style="flex:1;cursor:pointer" onclick="switchAccount(\${idx})"><div style="font-weight:600;display:flex;align-items:center">\${escapeHtml(acc.email)}\${isActive ? '<span class="badge">当前</span>' : ''}</div><div class="small" style="margin-bottom:0">\${acc.added || ''}</div></div>\${!isActive ? \`<button class="trash-btn" onclick="removeAccount(\${idx})" title="移除账号">✕</button>\` : ''}\`; cont.appendChild(div);
+          const isActive = isActiveAccount(acc, current); const div = document.createElement('div'); div.className = 'acct-row ' + (isActive ? 'acct-active' : '');
+          div.innerHTML = \`<div style="flex:1;cursor:pointer" onclick="switchAccount(\${idx})"><div style="font-weight:600;display:flex;align-items:center">\${escapeHtml(acctLabel(acc))}\${isActive ? '<span class="badge">当前</span>' : ''}\${acc && acc.oauth ? '<span class="badge" style="background:#eef2ff;color:#3730a3">OAuth</span>' : ''}</div><div class="small" style="margin-bottom:0">\${acc && acc.oauth ? (acc.scope || 'OAuth 连接') : (acc.added || '')}</div></div>\${!isActive ? \`<button class="trash-btn" onclick="removeAccount(\${idx})" title="移除账号">✕</button>\` : ''}\`; cont.appendChild(div);
         });
       }
       el('accountModal').style.display = 'flex';
     }
-    function switchAccount(idx) { const arr = loadSaved(); if (arr[idx]) { localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key); localStorage.removeItem('cf_accountId'); showNotification('正在切换账号...'); setTimeout(() => location.reload(), 500); } }
-    function removeAccount(idx) { confirmDialog('确定移除该账号？KV 中同名账号也会一并移除。', () => { const arr = loadSaved(); arr.splice(idx, 1); saveAccounts(arr); const ap = el('accounts-page'); if (ap && ap.classList.contains('active')) renderAccounts(); else openAccountSwitcher(); }); }
+    function switchAccount(idx) {
+      const arr = loadSaved(); if (!arr[idx]) return;
+      const acc = arr[idx];
+      if (acc && acc.oauth) { localStorage.setItem('cf_active_oauth', acc.oauthId); localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); }
+      else { localStorage.setItem('cf_active_email', acc.email); localStorage.setItem('cf_active_key', acc.key); localStorage.removeItem('cf_active_oauth'); }
+      localStorage.removeItem('cf_accountId'); showNotification('正在切换账号...'); setTimeout(() => location.reload(), 500);
+    }
+    function removeAccount(idx) {
+      const arr0 = loadSaved(); const target = arr0[idx];
+      const tip = (target && target.oauth) ? '确定断开该 OAuth 连接？本面板将删除其访问令牌。如需在 Cloudflare 侧彻底撤销授权，请到 dash → My Profile → 授权应用 操作。' : '确定移除该账号？KV 中同名账号也会一并移除。';
+      confirmDialog(tip, () => { const arr = loadSaved(); const rm = arr[idx]; arr.splice(idx, 1); saveAccounts(arr); if (rm && rm.oauth && getActiveCreds().oauthId === rm.oauthId) localStorage.removeItem('cf_active_oauth'); const ap = el('accounts-page'); if (ap && ap.classList.contains('active')) { renderAccounts(); } else openAccountSwitcher(); });
+    }
     function closeAccountSwitcher() { el('accountModal').style.display = 'none'; }
     function goAccounts(){ closeAccountSwitcher(); navTo('accounts'); }
 
@@ -3075,8 +3321,8 @@ function renderStaticJS(env) {
     const RESOURCE_PAGES = ['workers','pages-manager','snippets','kv','d1','dns','batch','pages','bulk'];
     function ensureAccount(){
       const a = getActiveCreds();
-      if (a.email && a.key) return true;
-      showNotification('该页面需要执行账号：请先选择或添加一个 CF 账号', 'error');
+      if (a.oauthId || (a.email && a.key)) return true;
+      showNotification('该页面需要执行账号：请先选择或添加一个 CF 账号（Global Key 或 OAuth）', 'error');
       openAccountSwitcher();
       return false;
     }
@@ -3113,7 +3359,11 @@ function renderStaticJS(env) {
         const r = await api('load-accounts-kv', {});
         if (r && r.success && Array.isArray(r.accounts)) {
           const cur = loadSaved(); const m = r.accounts.slice();
-          cur.forEach(a => { const i = m.findIndex(x => x.email === a.email); if (i > -1) { if (a.group && !m[i].group) m[i].group = a.group; } else m.push(a); });
+          cur.forEach(a => {
+            if (!a) return;
+            const i = (a.oauth ? m.findIndex(x => x && x.oauth && x.oauthId === a.oauthId) : m.findIndex(x => x && !x.oauth && x.email === a.email));
+            if (i > -1) { if (a.group && !m[i].group) m[i].group = a.group; } else m.push(a);
+          });
           localStorage.setItem('cf_accounts', JSON.stringify(m));
           return m;
         }
@@ -3128,31 +3378,45 @@ function renderStaticJS(env) {
       if (el('ovAccOk')) el('ovAccOk').textContent = ok;
       if (el('ovAccBad')) el('ovAccBad').textContent = bad;
       const act = getActiveCreds();
-      if (el('ovActive')) el('ovActive').textContent = act.email ? maskEmailShort(act.email) : '未选择';
+      if (el('ovActive')) el('ovActive').textContent = act.oauthId ? (act.name || 'OAuth 连接') : act.email ? maskEmailShort(act.email) : '未选择';
     }
     async function renderAccounts(){
       const arr = await kvMergeAccounts();
       const box = el('accountsBox'); if (!box) return;
       const act = getActiveCreds();
       box.innerHTML = '';
-      if (!arr.length) { box.innerHTML = '<div style="padding:18px;color:#64748b;text-align:center">暂无账号 —— 点击右上「添加账号」或「批量导入」</div>'; return; }
+      if (!arr.length) { box.innerHTML = '<div style="padding:18px;color:#64748b;text-align:center">暂无账号 —— 点击右上「添加账号」（Global Key）或到「设置 → OAuth 免密钥接入」授权连接</div>'; return; }
       arr.forEach((a, idx) => {
-        const st = accountStatusText(a); const isActive = act.email === a.email;
+        const isOa = !!(a && a.oauth);
+        const st = accountStatusText(a); const isActive = isActiveAccount(a, act);
         const row = document.createElement('div');
         row.className = 'worker-row';
         row.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:8px';
         const left = document.createElement('div'); left.style.cssText = 'flex:1;min-width:0';
         const emailLine = document.createElement('div'); emailLine.style.cssText = 'font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap';
-        emailLine.appendChild(document.createTextNode(a.email));
+        emailLine.appendChild(document.createTextNode(acctLabel(a)));
         if (isActive) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = '执行账号'; emailLine.appendChild(b); }
+        if (isOa) { const b = document.createElement('span'); b.style.cssText = 'font-size:11px;background:#eef2ff;color:#3730a3;border-radius:4px;padding:1px 6px'; b.textContent = 'OAuth 授权'; emailLine.appendChild(b); }
         if (a.group) { const g = document.createElement('span'); g.style.cssText = 'font-size:11px;background:#eef2ff;color:#3730a3;border-radius:4px;padding:1px 6px'; g.textContent = a.group; emailLine.appendChild(g); }
         const st2 = document.createElement('span'); st2.style.cssText = 'font-size:11px;color:' + st.c; st2.textContent = st.t; emailLine.appendChild(st2);
         const meta = document.createElement('div'); meta.className = 'small'; meta.style.cssText = 'margin:0;color:#94a3b8';
-        meta.textContent = (a.statusReason ? a.statusReason + ' · ' : '') + (a.added ? '添加于 ' + a.added : '');
+        const metaParts = [];
+        if (isOa) {
+          if (a.scope) metaParts.push('Scope: ' + String(a.scope).slice(0, 90) + (a.scope.length > 90 ? '…' : ''));
+          if (a.accountId) metaParts.push('Account: ' + String(a.accountId).slice(0, 10) + '…');
+          if (a.expiresAt) { const ex = new Date(a.expiresAt); metaParts.push('Token 过期 ' + (ex.getTime() < Date.now() ? '（已过期，将自动刷新）' : ex.toLocaleString('zh-CN', { hour12:false }))); }
+          if (a.added) metaParts.push('授权于 ' + a.added);
+        } else {
+          if (a.statusReason) metaParts.push(a.statusReason);
+          if (a.added) metaParts.push('添加于 ' + a.added);
+        }
+        meta.textContent = metaParts.join(' · ');
         left.appendChild(emailLine); left.appendChild(meta); row.appendChild(left);
         const btns = document.createElement('div'); btns.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap';
         btns.innerHTML = '<button class="btn small" onclick="setActiveAccount(' + idx + ')">设为执行账号</button>' +
-          '<button class="btn small" onclick="editAccountGroup(' + idx + ')">分组</button>' +
+          (isOa
+            ? '<button class="btn small" onclick="oauthDisconnect(\\'' + a.oauthId + '\\')">断开</button>'
+            : '<button class="btn small" onclick="editAccountGroup(' + idx + ')">分组</button>') +
           '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="removeAccount(' + idx + ')">移除</button>';
         row.appendChild(btns); box.appendChild(row);
       });
@@ -3170,7 +3434,7 @@ function renderStaticJS(env) {
       const acc = { email, key, added: now }; if (group) acc.group = group;
       if (i !== -1) arr[i] = acc; else arr.unshift(acc);
       saveAccounts(arr);
-      localStorage.setItem('cf_active_email', email); localStorage.setItem('cf_active_key', key);
+      localStorage.setItem('cf_active_email', email); localStorage.setItem('cf_active_key', key); localStorage.removeItem('cf_active_oauth'); localStorage.removeItem('cf_accountId');
       updateAcctBadge(); closeAddAccount(); showNotification('已添加并设为执行账号');
       setTimeout(() => location.reload(), 400);
     }
@@ -3202,12 +3466,15 @@ function renderStaticJS(env) {
     }
     function setActiveAccount(idx){
       const arr = loadSaved(); if (!arr[idx]) return;
-      localStorage.setItem('cf_active_email', arr[idx].email); localStorage.setItem('cf_active_key', arr[idx].key);
+      const acc = arr[idx];
+      if (acc && acc.oauth) { localStorage.setItem('cf_active_oauth', acc.oauthId); localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); }
+      else { localStorage.setItem('cf_active_email', acc.email); localStorage.setItem('cf_active_key', acc.key); localStorage.removeItem('cf_active_oauth'); }
       localStorage.removeItem('cf_accountId'); updateAcctBadge(); showNotification('已切换执行账号');
       renderAccounts();
     }
     async function loadSettingsAll(){
       loadSubdomainSettings();
+      loadOAuthUI();
       try { const r = await api('load-tg-config', {}); if (r && r.success && r.config) {
         if (r.config.botTokenSet) el('tgBotToken').placeholder = '已保存 (' + r.config.botToken + ')';
         if (r.config.chatId) el('tgChatId').value = r.config.chatId;
@@ -3216,9 +3483,59 @@ function renderStaticJS(env) {
       try { const r = await api('load-notify-config', {}); if (r && r.success && r.config) { fillNotifyConfig(r.config); } } catch(e){}
     }
 
+    // ===== OAuth 免密钥接入（设置页）=====
+    async function loadOAuthUI(){
+      const hint = el('oauthRedirectHint'); if (hint) hint.textContent = location.origin + '/oauth/callback';
+      try {
+        const r = await api('load-oauth-client', {});
+        if (!r || !r.success) return;
+        if (r.configured) {
+          const ci = el('oauthClientId'); if (ci) ci.value = r.clientId || '';
+          const sel = el('oauthAuthMethod'); if (sel && r.authMethod) sel.value = r.authMethod;
+          if (r.hasSecret) { const cs = el('oauthClientSecret'); if (cs) { cs.placeholder = 'Secret 已保存（留空保持不变）'; cs.value = ''; } }
+        }
+        const box = el('oauthConnBox');
+        if (box) {
+          if (!r.connections || !r.connections.length) box.innerHTML = '尚未授权任何连接。保存配置后点「前往 Cloudflare 授权」。';
+          else box.innerHTML = r.connections.map(c =>
+            '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px dashed #e2e8f0">' +
+            '<span><b>' + escapeHtml(c.name) + '</b> <span style="color:#94a3b8">' + escapeHtml(String(c.scope || '').slice(0, 60)) + '</span></span>' +
+            '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="oauthDisconnect(\\'' + c.oauthId + '\\')">断开</button></div>'
+          ).join('');
+        }
+      } catch(e){}
+    }
+    async function saveOAuthConfig(){
+      const clientId = (el('oauthClientId').value || '').trim();
+      if (!clientId) return showNotification('请填写 Client ID', 'error');
+      const secret = (el('oauthClientSecret').value || '').trim();
+      const authMethod = el('oauthAuthMethod').value;
+      const r = await api('save-oauth-client', { clientId, clientSecret: secret, authMethod });
+      if (r && r.success) { showNotification('OAuth 配置已保存'); loadOAuthUI(); }
+      else showNotification((r && r.error) || '保存失败', 'error');
+    }
+    async function oauthConnect(){
+      const r = await api('oauth-begin', {});
+      if (r && r.success && r.url) { location.href = r.url; }
+      else showNotification((r && r.error) || '无法生成授权地址：请先保存 OAuth 配置', 'error');
+    }
+    async function oauthDisconnect(oauthId){
+      confirmDialog('断开该 OAuth 连接？面板将删除其令牌；如需在 Cloudflare 侧彻底撤销授权，请到 dash → My Profile → 授权应用。', async () => {
+        const r = await api('oauth-revoke-account', { oauthId });
+        const arr = loadSaved();
+        const i = arr.findIndex(a => a && a.oauth && a.oauthId === oauthId);
+        if (i !== -1) arr.splice(i, 1);
+        localStorage.setItem('cf_accounts', JSON.stringify(arr));
+        if (getActiveCreds().oauthId === oauthId) localStorage.removeItem('cf_active_oauth');
+        if (r && r.success) showNotification('已断开 OAuth 连接'); else showNotification('本地已移除（服务端断开失败：' + ((r && r.error) || '未知') + '）', 'error');
+        renderAccounts(); loadOAuthUI(); updateAcctBadge();
+      });
+    }
+    window.saveOAuthConfig = saveOAuthConfig; window.oauthConnect = oauthConnect; window.oauthDisconnect = oauthDisconnect;
+
     // ===== UI 增强：账号徽标 / 暗色 / 抽屉 / 确认弹窗 / 搜索排序 / 键盘 =====
     function maskEmailShort(e){ const i = String(e||'').indexOf('@'); if (i <= 0) return e||'未登录'; const u = e.slice(0,i), d = e.slice(i+1); return (u.length <= 1 ? '*' : u.slice(0,1)+'***') + '@' + d; }
-    function updateAcctBadge(){ const a = getActiveCreds(); const el1 = el('acctInfo'); if (el1) el1.textContent = a.email ? maskEmailShort(a.email) : '未登录'; }
+    function updateAcctBadge(){ const a = getActiveCreds(); const el1 = el('acctInfo'); if (!el1) return; el1.textContent = a.oauthId ? (a.name || 'OAuth') : a.email ? maskEmailShort(a.email) : '未登录'; }
     function toggleSidebar(){ const s = document.querySelector('.sidebar'); if (s) s.classList.toggle('open'); }
     function closeAllModals(){ document.querySelectorAll('.modal').forEach(m => { if (m.id !== 'accountModal') m.style.display = 'none'; }); }
     // confirmDialog / closeAllModals 已在顶层公共区定义
@@ -4120,11 +4437,11 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
 
     (async function init() {
       let creds = getActiveCreds();
-      if (!creds.email || !creds.key) {
+      if (!(creds.oauthId || (creds.email && creds.key))) {
         // 等 KV 恢复完成：把账号库并进本地，但不强制激活任何账号
         try { await (window.__kvRestorePromise || Promise.resolve()); } catch(e){}
         creds = getActiveCreds();
-        if (!creds.email || !creds.key) {
+        if (!(creds.oauthId || (creds.email && creds.key))) {
           // 两级结构：无执行账号也可使用全局页（总览/监控中心/账号库/设置）
           updateAcctBadge(); navTo('overview'); return;
         }
