@@ -2140,8 +2140,8 @@ async function storeAnalytics(env){
   const date = et.slice(0,10);
   const out = {}; const diagArr = []; let ok = 0, fail = 0;
   for(const c of creds){
+    const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
     try {
-      const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
       const key = c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key;
       if(!key){ fail++; continue; }
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
@@ -2187,7 +2187,7 @@ async function storeAnalytics(env){
       out[email] = { email, accountId, name: c.name || '', zones: zonesAgg, req, bytes, uniq, points, countries: top(cmap, 8), statuses: top(smap, 8), colos: top(lmap, 8) };
       diagArr.push({ email, zones: zones.length, error: _anErr || '' });
       ok++;
-    } catch(e){ fail++; }
+    } catch(e){ fail++; diagArr.push({ email, zones: 0, error: '异常: ' + String((e && e.message) || e).slice(0, 140) }); }
   }
   const diag = diagArr;
   await kvPut(env, 'an_diag', { ts: et, kind: 'hourly', items: diag });
@@ -2211,14 +2211,14 @@ async function storeOfficialAnalytics(env, days = 92){
   const ge = new Date(now.getTime() - (days - 1) * 86400000).toISOString().slice(0,10);
   const diagArr = []; let merged = null; let ok = 0, fail = 0;
   for(const c of creds){
+    const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
     try {
-      const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
       const key = c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key;
       if(!key){ fail++; continue; }
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
       if(!accountId){ fail++; continue; }
       const zlist = await cfZonesOfAccount(env, email, key, accountId).catch(() => ({ tags: [], names: {} }));
-      const zq = 'query($zid:String!,$ge:Date!,$le:Date!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:$ge,date_leq:$le}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}';
+      const zq = 'query($zid:String!,$ge:Date!,$le:Date!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1dGroups(limit:10000,filter:{date_geq:$ge,date_leq:$le}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}';
       const zones = [];
       let _anErr = '';
       for (const zid of zlist.tags) {
@@ -2256,7 +2256,7 @@ async function storeOfficialAnalytics(env, days = 92){
       }
       diagArr.push({ email, zones: (zones && zones.length) || 0, error: _anErr || '' });
       ok++;
-    } catch(e){ fail++; }
+    } catch(e){ fail++; diagArr.push({ email, zones: 0, error: '异常: ' + String((e && e.message) || e).slice(0, 140) }); }
   }
   if(ok && merged){
     // 保留期裁剪：仅保留最近 days+15 天的日期，防 KV 无限膨胀
