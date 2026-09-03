@@ -1220,10 +1220,11 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
 
       // ================= 监控中心 actions（走 KV 凭据，免登录校验） =================
       case 'get-dashboard': {
-        const out = { snap: null, daily: {}, usage: {}, accounts: [], officialDaily: {}, officialFetchedAt: '' };
+        const out = { snap: null, daily: {}, usage: {}, accounts: [], officialDaily: {}, officialFetchedAt: '', officialUsage: {}, officialUsageFetchedAt: '' };
         try { const r = await kvGet(env, 'an_snap'); if (r) out.snap = JSON.parse(r); } catch(e){}
         try { const r = await kvGet(env, 'an_daily'); if (r) out.daily = JSON.parse(r) || {}; } catch(e){}
         try { const r = await kvGet(env, 'official_daily'); if (r) { const od = JSON.parse(r) || {}; out.officialDaily = od.data || {}; out.officialFetchedAt = od.fetchedAt || ''; } } catch(e){}
+        try { const r = await kvGet(env, 'official_usage'); if (r) { const ou = JSON.parse(r) || {}; out.officialUsage = ou.data || {}; out.officialUsageFetchedAt = ou.fetchedAt || ''; } } catch(e){}
         try { const r = await kvGet(env, 'usage_history'); if (r) out.usage = JSON.parse(r) || {}; } catch(e){}
         try {
           const accs = await loadKVAccounts(env);
@@ -1236,6 +1237,46 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         const h = await storeAnalytics(env);        // 24h 快照（官方 1hGroups 直读）
         const d = await storeOfficialAnalytics(env); // 官方按日 92 天直读
         return json({ success: true, ok: h.ok + d.ok, fail: h.fail + d.fail });
+      }
+
+      case 'backfill-usage-history': {
+        if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
+        const daysN = Math.min(Math.max(parseInt(payload.days, 10) || 14, 1), 30);   // 上限 30 天，逐日官方现查
+        const creds = await loadKVAccounts(env);
+        if(!creds.length) return json({ success: false, error: 'KV 中无账号' });
+        let merged = null;
+        try { const r = await kvGet(env, 'official_usage'); if (r) merged = JSON.parse(r) || null; } catch(e){ merged = null; }
+        if(!merged) merged = { data:{} };
+        let ok = 0, fail = 0;
+        const iso = (d) => { const x = new Date(d); x.setUTCHours(0,0,0,0); return x.toISOString(); };
+        const dates = [];
+        for (let i = 1; i <= daysN; i++) dates.push(iso(Date.now() - i * 86400000));   // 昨天起往前 N 天
+        for (const c of creds){
+          const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
+          const key = c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key;
+          if(!key){ fail++; continue; }
+          try {
+            const ar = await cfGet('/accounts', c.email, oauthOrKey(c));
+            if(!ar || !ar.success){ fail++; continue; }
+            for(const a of (ar.result||[])){
+              for(const s of dates){
+                const e = new Date(new Date(s).getTime() + 86400000 - 1).toISOString();
+                const u = await queryUsageByAccountId(c.email, oauthOrKey(c), a.id, s, e);
+                if(u.error) continue;
+                const date = s.slice(0,10);
+                const arr = merged.data[date] = merged.data[date] || [];
+                const idx = arr.findIndex(x => x.email === email && x.accountId === a.id);
+                const rec = { email, accountId: a.id, name: a.name || '', total: u.total, workers: u.workers, pages: u.pages };
+                if (idx > -1) arr[idx] = rec; else arr.push(rec);
+              }
+            }
+            ok++;
+          } catch(e){ fail++; }
+        }
+        const ds = Object.keys(merged.data).sort(); while (ds.length > 70) delete merged.data[ds.shift()];
+        merged.fetchedAt = new Date().toISOString();
+        await kvPut(env, 'official_usage', merged);
+        return json({ success: true, ok, fail, days: dates.length });
       }
 
       case 'get-usage-trend': {
@@ -1740,11 +1781,15 @@ async function handleTelegramWebhook(request, env){
   return new Response('ok', { status: 200 });
 }
 const TG_USAGE_QUERY = `query Usage($accountId:String!,$filter:AccountWorkersInvocationsAdaptiveFilter_InputObject){viewer{accounts(filter:{accountTag:$accountId}){pagesFunctionsInvocationsAdaptiveGroups(limit:1000,filter:$filter){sum{requests}}workersInvocationsAdaptive(limit:10000,filter:$filter){dimensions{scriptName}sum{requests}}}}}`;
-async function queryUsageByAccountId(email, key, accountId){
-  const now = new Date();
-  const end = now.toISOString();
-  now.setUTCHours(0,0,0,0);
-  const start = now.toISOString();
+async function queryUsageByAccountId(email, key, accountId, startISO, endISO){
+  let start, end;
+  if (startISO && endISO) { start = startISO; end = endISO; }
+  else {
+    const now = new Date();
+    end = now.toISOString();
+    now.setUTCHours(0,0,0,0);
+    start = now.toISOString();
+  }
   const r = await fetch('https://api.cloudflare.com/client/v4/graphql', {
     method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)),
     body: JSON.stringify({ query: TG_USAGE_QUERY, variables:{ accountId, filter:{ datetime_geq:start, datetime_leq:end } } })
@@ -2153,6 +2198,46 @@ async function storeOfficialAnalytics(env, days = 92){
   return { ok, fail };
 }
 
+// 配额/用量官方历史：workersInvocationsAdaptive 免费计划单次查询窗口 ≤1 天（date_geq/date_leq 同日）
+// 官方历史只能逐日累积：cron 每日现查"今天+昨天"合并写入 KV official_usage（结构同 usage_history：date->[{email,workers,pages,total}]）
+async function storeOfficialUsage(env){
+  const creds = await loadKVAccounts(env);
+  if(!creds.length) return { ok:0, fail:0 };
+  let merged = null;
+  try { const r = await kvGet(env,'official_usage'); if(r) merged = JSON.parse(r) || null; } catch(e){ merged = null; }
+  if(!merged) merged = { data:{} };
+  let ok = 0, fail = 0;
+  const iso = (d) => { const x = new Date(d); x.setUTCHours(0,0,0,0); return x.toISOString(); };
+  const today = iso(Date.now());
+  const days = [ today, iso(Date.now() - 86400000) ];
+  for(const c of creds){
+    const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
+    const key = c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key;
+    if(!key){ fail++; continue; }
+    try {
+      const ar = await cfGet('/accounts', c.email, oauthOrKey(c));
+      if(!ar || !ar.success) { fail++; continue; }
+      for(const a of (ar.result||[])){
+        for(const s of days){
+          const e = new Date(new Date(s).getTime() + 86400000 - 1).toISOString();
+          const u = await queryUsageByAccountId(c.email, oauthOrKey(c), a.id, s, e);
+          if(u.error) continue;
+          const date = s.slice(0,10);
+          const arr = merged.data[date] = merged.data[date] || [];
+          const idx = arr.findIndex(x => x.email === email && x.accountId === a.id);
+          const rec = { email, accountId: a.id, name: a.name || '', total: u.total, workers: u.workers, pages: u.pages };
+          if (idx > -1) arr[idx] = rec; else arr.push(rec);
+        }
+      }
+      ok++;
+    } catch(e){ fail++; }
+  }
+  const ds = Object.keys(merged.data).sort(); while (ds.length > 70) delete merged.data[ds.shift()];
+  merged.fetchedAt = new Date().toISOString();
+  await kvPut(env, 'official_usage', merged);
+  return { ok, fail };
+}
+
 function computeUsageTrend(history, days){
   const dates = Object.keys(history||{}).sort().slice(-days);
   return dates.map(d => ({ date:d, total:(history[d]||[]).reduce((t,r)=>t+(r.total||0),0) }));
@@ -2435,6 +2520,7 @@ async function runDailyMonitoring(env){
   await storeDailySnapshots(env);
   await storeAnalytics(env).catch(()=>{});
   await storeOfficialAnalytics(env).catch(()=>{});
+  await storeOfficialUsage(env).catch(()=>{});
   await storeStorageUsage(env);
   const cur = await snapshotAssets(env);
   let prev = null; try { const r = await kvGet(env,'asset_snapshot'); if(r) prev = JSON.parse(r); } catch(e){}
@@ -2929,13 +3015,13 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
           <span id="dashDailySrc" style="font-weight:400;font-size:11px;color:#94a3b8"></span></div>
           <div id="dashDaily" class="small" style="font-family:monospace;margin-top:6px">-</div>
         </div>
-        <div class="card" style="margin-top:0"><div style="font-weight:700">配额消耗 14 天</div><div id="dashQuotaChart" class="small" style="font-family:monospace;margin-top:6px">-</div></div>
+        <div class="card" style="margin-top:0"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-weight:700">配额消耗 14 天</span><span style="font-weight:400;font-size:11px;color:#94a3b8" id="dashQuotaSrc">官方直读</span><button class="btn small" onclick="backfillUsageHistory()">回填官方历史(≤30 天)</button></div><div id="dashQuotaChart" class="small" style="font-family:monospace;margin-top:6px">-</div></div>
       </div>
       <div class="card" style="margin-top:12px">
         <h3 style="margin:0 0 8px">账号明细 <span class="small">点「Zones」下钻 · 点「设为执行」切换</span></h3>
         <div id="dashTable" class="small" style="font-family:monospace"></div>
       </div>
-      <div class="small" style="margin-top:10px;color:#94a3b8;line-height:1.7">免费计划官方分析仅保留最近 24h；多日曲线由本面板每 4h 自动采集累积。数据非实时，点「立即采集」刷新（会向每个有效账号发起一次 GraphQL 查询）。</div>
+      <div class="small" id="dashSrcNote" style="margin-top:10px;color:#94a3b8;line-height:1.7"></div>
     </div>
 
     <!-- Accounts Page（账号库 · 全局） -->
@@ -4414,6 +4500,19 @@ function renderStaticJS(env) {
         renderDash();
       } finally { if (btn) { btn.disabled = false; btn.textContent = '立即采集'; } }
     }
+    async function backfillUsageHistory(){
+      confirmDialog('将按天向官方查询最近 30 天配额用量（每账号每天 1 次 GraphQL；免费单次窗口≤1 天，故逐日回填），结果入官方配额历史供趋势图直读。继续？', async () => {
+        const btn = el('dashCollectBtn');
+        const r = await api('backfill-usage-history', { days: 30 });
+        if (r && r.success) {
+          dashCache = null;
+          const d = await api('get-dashboard', {});
+          dashCache = (d && d.success) ? d.dash : null;
+          showNotification('回填完成：成功 ' + r.ok + ' 个账号' + (r.fail ? '，失败 ' + r.fail : '') + '，覆盖 ' + r.days + ' 天');
+          renderDash();
+        } else showNotification((r && r.error) || '回填失败', 'error');
+      });
+    }
     function renderDash(){
       const d = dashCache;
       const t = (id, txt) => { const e = el(id); if (e) e.textContent = txt; };
@@ -4500,14 +4599,25 @@ function renderStaticJS(env) {
         return { l: dd.slice(5), v: sum };
       });
       el('dashDaily').innerHTML = dpts.length ? barHtml(dpts) : '<span style="color:#94a3b8">暂无数据（官方：点「立即采集」；自采需每日累积）</span>';
-      // 配额 14 天
-      const uk = Object.keys(d.usage || {}).sort().slice(-14);
+      // 配额 14 天：官方逐日历史(official_usage)优先，自采 usage_history 兜底
+      const usageSrc = (d.officialUsage && Object.keys(d.officialUsage).length) ? d.officialUsage : (d.usage || {});
+      const ql = el('dashQuotaSrc'); if (ql) ql.textContent = (d.officialUsage && Object.keys(d.officialUsage).length) ? '官方直读(逐日累积)' : '自采(每日累积)';
+      const uk = Object.keys(usageSrc).sort().slice(-14);
       const qpts = uk.map(dd => {
-        const rows = (d.usage[dd] || []).filter(r => !el('dashScope').value || r.email === el('dashScope').value);
+        const rows = (usageSrc[dd] || []).filter(r => !el('dashScope').value || r.email === el('dashScope').value);
         return { l: dd.slice(5), v: rows.reduce((s, r) => s + (r.total || 0), 0) };
       });
       const quotaWarn = qpts.length >= 3 && qpts.slice(-7).reduce((s, p) => s + p.v, 0) / Math.min(7, qpts.length) > 80000;
       el('dashQuotaChart').innerHTML = (qpts.length ? barHtml(qpts) : '<span style="color:#94a3b8">-</span>') + (quotaWarn ? '<div style="color:#b45309;margin-top:4px;font-size:11px">近 7 日均值 &gt; 8 万，可能提前耗尽配额</div>' : '');
+      // 数据源标注
+      const snote = el('dashSrcNote');
+      if (snote) {
+        const l = (iso) => iso ? new Date(iso).toLocaleString('zh-CN', { hour12:false }) : '';
+        const odA = d.officialFetchedAt ? new Date(d.officialFetchedAt).toLocaleDateString('zh-CN') : '';
+        const ouA = d.officialUsageFetchedAt ? new Date(d.officialUsageFetchedAt).toLocaleDateString('zh-CN') : '';
+        const uhLast = Object.keys(d.usage || {}).sort().pop() || '';
+        snote.innerHTML = '数据源：24h 走势/带宽/访问=官方 1hGroups（采集 ' + l((d.snap && d.snap.ts) || '') + '）· 请求趋势/缓存命中/威胁=官方 1dGroups（' + (odA || '未采') + '）· 配额=官方 workersInvocations（' + (ouA || '未采') + (ouA ? '' : '，自采至 ' + uhLast) + '）· 证书/WAF/状态=官方(≤6h 现查)。免费计划官方小时级仅 3 天、日级 365 天；点「立即采集」按官方现查刷新。';
+      }
       // 明细表
       const rowsHtml = recs.map(a => {
         const accMeta = (d.accounts || []).find(x => (x.email || x.name) === (a.email || a.name));
@@ -4544,7 +4654,7 @@ function renderStaticJS(env) {
       dashApplyScope(emailKey);
       showNotification('已设为执行账号：' + emailKey + '（总览已切到该账号）');
     }
-    window.renderDash = renderDash; window.dashScopeChanged = dashScopeChanged; window.trendDaysChanged = trendDaysChanged; window.collectAnalyticsNow = collectAnalyticsNow; window.openDashZones = openDashZones; window.dashSetActive = dashSetActive;
+    window.renderDash = renderDash; window.dashScopeChanged = dashScopeChanged; window.trendDaysChanged = trendDaysChanged; window.backfillUsageHistory = backfillUsageHistory; window.collectAnalyticsNow = collectAnalyticsNow; window.openDashZones = openDashZones; window.dashSetActive = dashSetActive;
     async function renderAccounts(){
       const arr = await kvMergeAccounts();
       const box = el('accountsBox'); if (!box) return;
@@ -6077,7 +6187,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
         }
       };
       const r = await api('save-tg-config', { config });
-      if(r && r.success){ if (!checkedBjs.length) showNotification('未勾选时段，已按默认北京 7 点(UTC 23)推送'); else showNotification('TG 配置已保存（日报 ' + reportHours.length + ' 个时段）'); }
+      if(r && r.success){ if (!checkedBjs.length) showNotification('未勾选时段，已按默认北京 7 点(UTC 23)推送'); else showNotification('TG 配置已保存（日报 ' + reportHours.length + ' 个时段）' + (reportHours.length > 3 ? '⚠ 每次推送都会现场官方查询，建议 ≤3 档' : '')); }
       else showNotification((r&&r.error)||'保存失败','error');
     }
     async function testTG(){
