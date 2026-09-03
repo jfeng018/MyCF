@@ -44,6 +44,15 @@ const OAUTH_CLIENT_KV = 'oauth_client';
 function randHex(n){ const b = crypto.getRandomValues(new Uint8Array(n)); let s=''; for(let i=0;i<b.length;i++) s += b[i].toString(16).padStart(2,'0'); return s; }
 // OAuth token 注入密钥前缀：cfHeaders 识别后改用 Authorization: Bearer
 const OAUTH_KEY_PREFIX = '__oa_';
+// 账号凭据二选一/回退：OAuth token 新鲜用 Bearer；失效/撤销且存有 Global Key 则回退 key；否则仍按 oauth 尝试
+function oauthOrKey(a){
+  if (!a) return '';
+  if (!a.oauth) return a.key || '';
+  const fresh = a.accessToken && (!a.expiresAt || a.expiresAt > Date.now() + 60000);
+  if (fresh) return OAUTH_KEY_PREFIX + a.accessToken;
+  if (a.key) return a.key;
+  return a.accessToken ? OAUTH_KEY_PREFIX + a.accessToken : '';
+}
 
 // ---------------- 边缘缓存（降低 Cloudflare API 调用频率，规避限流） ----------------
 // 用 Cache API 在边缘缓存只读 GET 响应：跨 isolate / 区域命中，且不消耗 KV 写入额度（免费版仅 1000 写/日）。
@@ -218,9 +227,11 @@ async function handleAPI(req, env) {
           const fresh = (await loadKVAccounts(env)).find(a => a && a.oauth && a.oauthId === payload.oauthId);
           if (fresh && fresh.accessToken) { oaAcc.accessToken = fresh.accessToken; oaAcc.refreshToken = fresh.refreshToken; oaAcc.expiresAt = fresh.expiresAt; }
         }
-        if (!oaAcc.accessToken) return json({ success: false, error: 'OAuth token 缺失，请重新授权' }, 401);
         payload.email = oaAcc.email || oaAcc.name || '';
-        payload.key = OAUTH_KEY_PREFIX + oaAcc.accessToken;
+        // 双通道回退：OAuth token 新鲜走 Bearer；失效/撤销且存有 Global Key 时回退 key 通道
+        const credK = oauthOrKey(oaAcc);
+        if (!credK) return json({ success: false, error: 'OAuth 凭据不可用，请重新授权' }, 401);
+        payload.key = credK;
       } catch(e){ return json({ success: false, error: 'OAuth 会话解析失败：' + e.message }, 500); }
     }
     const isOa = typeof payload.key === 'string' && payload.key.startsWith(OAUTH_KEY_PREFIX);
@@ -783,7 +794,7 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
           if (sub && sub.oauth) {
             const old = prev.find(p => p && p.oauth && p.oauthId === sub.oauthId);
             if (!old) continue; // 新 oauth 记录只能由 /oauth/callback 创建
-            merged.push(Object.assign({}, old, sub, { accessToken: old.accessToken, refreshToken: old.refreshToken, expiresAt: old.expiresAt, accountId: old.accountId, accountIds: old.accountIds }));
+            merged.push(Object.assign({}, old, sub, { accessToken: old.accessToken, refreshToken: old.refreshToken, expiresAt: old.expiresAt, accountId: old.accountId, accountIds: old.accountIds, key: old.key || '' }));
           } else merged.push(sub);
         }
         await persistAccountsEnc(env, merged);
@@ -793,8 +804,8 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       case 'load-accounts-kv': {
         if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
         const accounts = await loadKVAccounts(env);
-        // oauth token 绝不回传前端
-        const sanitized = accounts.map(a => (a && a.oauth) ? Object.assign({}, a, { accessToken: '', refreshToken: '', key: '' }) : a);
+        // oauth token 绝不回传前端；双通道账号(含 Global Key)保留 key，供执行账号按 key 通道使用
+        const sanitized = accounts.map(a => (a && a.oauth) ? Object.assign({}, a, { accessToken: '', refreshToken: '' }) : a);
         return json({ success: true, accounts: sanitized });
       }
 
@@ -839,7 +850,15 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         const oauthId = payload.oauthId;
         if (!oauthId) return json({ success: false, error: 'oauthId required' }, 400);
         const arr = await loadKVAccounts(env);
-        const next = arr.filter(a => !(a && a.oauth && a.oauthId === oauthId));
+        const next = [];
+        for (const a of arr) {
+          if (a && a.oauth && a.oauthId === oauthId) {
+            // 双通道：仅剥离 oauth，保留 Global Key
+            if (a.key) next.push({ email: a.email || '', key: a.key, group: a.group || '', added: a.added || '', status: 'ok' });
+            continue; // 纯 oauth：整条移除
+          }
+          next.push(a);
+        }
         await persistAccountsEnc(env, next);
         return json({ success: true });
       }
@@ -1397,13 +1416,27 @@ async function persistAccountsEnc(env, arr){
   for (const a of arr) toStore.push(key ? await encJSON(a, key) : a);
   await env.CF_ACCOUNTS_KV.put('accounts', JSON.stringify(toStore));
 }
-// 同 accountId 已有 oauth 连接则原位更新（保留 oauthId，前端选择不失效）；否则新增
+// 同账号合并策略：① 已有 oauth 连接同 accountId → 更新；② 否则 email 命中已有 Global Key 账号 → 升级为双通道(保留 key)；③ 否则新增 oauth 连接
 async function upsertOAuthAccount(env, acc){
   const arr = await loadKVAccounts(env);
-  const i = arr.findIndex(a => a && a.oauth && acc.accountId && a.accountId === acc.accountId);
+  let i = arr.findIndex(a => a && a.oauth && acc.accountId && a.accountId === acc.accountId);
+  if (i === -1 && acc.email) i = arr.findIndex(a => a && !a.oauth && a.email === acc.email);
   let out;
-  if (i !== -1) { const old = arr[i]; out = Object.assign({}, old, acc, { oauthId: old.oauthId || acc.oauthId }); arr[i] = out; }
-  else { out = acc; arr.unshift(acc); }
+  if (i !== -1) {
+    const old = arr[i];
+    const merged = Object.assign({}, old, acc, {
+      oauth: true,
+      oauthId: old.oauthId || acc.oauthId,
+      accountId: old.accountId || acc.accountId,
+      key: old.key || (old.oauth ? '' : (old.key || '')),   // 保留已存的 Global Key(双通道并存)
+      accessToken: acc.accessToken || old.accessToken,
+      refreshToken: acc.refreshToken || old.refreshToken,
+      expiresAt: acc.expiresAt || old.expiresAt
+    });
+    if (!merged.email && old.email) merged.email = old.email;
+    if (!merged.name && old.name) merged.name = old.name;
+    out = merged; arr[i] = merged;
+  } else { out = acc; arr.unshift(acc); }
   await persistAccountsEnc(env, arr);
   return out;
 }
@@ -1697,7 +1730,7 @@ async function queryUsageByAccountId(email, key, accountId){
   return { total: pages+workers, workers, pages, percent: Math.min(100, ((pages+workers)/100000)*100), byScript, error:false };
 }
 async function queryAllUsageForCred(env, cred){
-  const ar = await cfGet('/accounts', cred.email, (cred.oauth ? OAUTH_KEY_PREFIX + cred.accessToken : cred.key));
+  const ar = await cfGet('/accounts', cred.email, oauthOrKey(cred));
   if(!ar || !ar.success || !Array.isArray(ar.result)) return [{ email:cred.email, error:'无法获取账号列表' }];
   const out = [];
   for(const a of ar.result){
@@ -1907,12 +1940,12 @@ async function snapshotAssets(env){
   const snap = { ts: Date.now(), accounts: {} };
   for(const c of creds){
     try {
-      const ar = await cfGet('/accounts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
+      const ar = await cfGet('/accounts', c.email, oauthOrKey(c));
       if(!ar.success){ snap.accounts[c.email] = { error:'凭据失效/403', alive:false }; continue; }
       const entry = { alive:true, accounts: [] };
       for(const a of (ar.result||[])){
-        let workers=[]; try { const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); workers = (wr.success&&wr.result)?wr.result.map(w=>w.id):[]; } catch(e){}
-        let zones=[]; try { const zr = await cfGet('/zones?account.id='+a.id, c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); zones = (zr.success&&zr.result)?zr.result.map(z=>({id:z.id,name:z.name,status:z.status})):[]; } catch(e){}
+        let workers=[]; try { const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, oauthOrKey(c)); workers = (wr.success&&wr.result)?wr.result.map(w=>w.id):[]; } catch(e){}
+        let zones=[]; try { const zr = await cfGet('/zones?account.id='+a.id, c.email, oauthOrKey(c)); zones = (zr.success&&zr.result)?zr.result.map(z=>({id:z.id,name:z.name,status:z.status})):[]; } catch(e){}
         entry.accounts.push({ id:a.id, name:a.name, workers, zones });
       }
       snap.accounts[c.email] = entry;
@@ -1977,11 +2010,11 @@ async function queryStorageUsage(env){
   const creds = await loadKVAccounts(env); const out = [];
   for(const c of creds){
     try {
-      const ar = await cfGet('/accounts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); if(!ar.success){ out.push({email:c.email, error:true}); continue; }
+      const ar = await cfGet('/accounts', c.email, oauthOrKey(c)); if(!ar.success){ out.push({email:c.email, error:true}); continue; }
       for(const a of (ar.result||[])){
-        let d1Count=0; try { const r = await cfGet('/accounts/'+a.id+'/d1/database', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); d1Count = (r.success&&r.result)?r.result.length:0; } catch(e){}
+        let d1Count=0; try { const r = await cfGet('/accounts/'+a.id+'/d1/database', c.email, oauthOrKey(c)); d1Count = (r.success&&r.result)?r.result.length:0; } catch(e){}
         let r2Ops=0, kvOps=0;
-        try { const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key))), body: JSON.stringify({ query: STORAGE_QUERY, variables:{ accountId:a.id } }) }); const res = await g.json(); const vr = res?.data?.viewer?.accounts?.[0]; r2Ops = vr?.r2AggregateAnalytics?.[0]?.sum?.requests||0; kvOps = vr?.kvOperationsAdaptive?.[0]?.sum?.requests||0; } catch(e){}
+        try { const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, oauthOrKey(c))), body: JSON.stringify({ query: STORAGE_QUERY, variables:{ accountId:a.id } }) }); const res = await g.json(); const vr = res?.data?.viewer?.accounts?.[0]; r2Ops = vr?.r2AggregateAnalytics?.[0]?.sum?.requests||0; kvOps = vr?.kvOperationsAdaptive?.[0]?.sum?.requests||0; } catch(e){}
         out.push({ email:c.email, accountId:a.id, name:a.name, d1Count, r2Ops, kvOps });
       }
     } catch(e){ out.push({ email:c.email, error:String(e) }); }
@@ -1995,10 +2028,10 @@ async function probeEndpoints(env){
   const creds = await loadKVAccounts(env); const results = [];
   for(const c of creds){
     try {
-      const ar = await cfGet('/accounts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); if(!ar.success) continue;
+      const ar = await cfGet('/accounts', c.email, oauthOrKey(c)); if(!ar.success) continue;
       for(const a of (ar.result||[])){
         try {
-          const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
+          const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, oauthOrKey(c));
           const workers = (wr.success&&wr.result)?wr.result:[];
           for(const w of workers.slice(0,3)){
             const sd = (w.defaultDomain&&w.defaultDomain.hostname) || (w.domains&&w.domains[0]&&w.domains[0].hostname);
@@ -2026,10 +2059,10 @@ async function checkCertExpiry(env){
   const creds = await loadKVAccounts(env); const out = [];
   for(const c of creds){
     try {
-      const zr = await cfGet('/zones', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); if(!zr.success) continue;
+      const zr = await cfGet('/zones', c.email, oauthOrKey(c)); if(!zr.success) continue;
       for(const z of (zr.result||[])){
         try {
-          const cr = await cfGet('/zones/'+z.id+'/ssl/certificate_packs', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
+          const cr = await cfGet('/zones/'+z.id+'/ssl/certificate_packs', c.email, oauthOrKey(c));
           const packs = (cr.success&&cr.result)?cr.result:[];
           let minDays=null;
           for(const p of packs){ for(const crt of (p.certificates||[])){ if(crt.expires_on){ const d = Math.ceil((new Date(crt.expires_on)-Date.now())/86400000); if(minDays===null||d<minDays) minDays=d; } } }
@@ -2051,12 +2084,12 @@ async function checkWaf(env){
   const creds = await loadKVAccounts(env); const out = [];
   for(const c of creds){
     try {
-      const zr = await cfGet('/zones', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
+      const zr = await cfGet('/zones', c.email, oauthOrKey(c));
       for(const z of (zr.result||[])){
         try {
           const end = new Date().toISOString(); const start = new Date(Date.now()-86400000).toISOString();
           const q = `query W($zone:String!,$f:ZoneFirewallEventsFilter_InputObject){viewer{zones(filter:{zoneTag:$zone}){firewallEventsAdaptiveGroups(limit:1,filter:$f){sum{requests}}}}}`;
-          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key))), body: JSON.stringify({ query:q, variables:{ zone:z.id, f:{ datetime_geq:start, datetime_leq:end } } }) });
+          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, oauthOrKey(c))), body: JSON.stringify({ query:q, variables:{ zone:z.id, f:{ datetime_geq:start, datetime_leq:end } } }) });
           const res = await g.json(); const cnt = res?.data?.viewer?.zones?.[0]?.firewallEventsAdaptiveGroups?.[0]?.sum?.requests || 0;
           out.push({ email:c.email, zone:z.name, blocked:cnt });
         } catch(e){}
@@ -2110,7 +2143,7 @@ async function updateAccountStatuses(env){
       try { await refreshOAuthToken(env, a); } catch(e){}
     }
     try {
-      const ar = await cfAny('GET','/accounts', a.email, (a.oauth ? OAUTH_KEY_PREFIX + a.accessToken : a.key));
+      const ar = await cfAny('GET','/accounts', a.email, oauthOrKey(a));
       if(!ar || !ar.success){
         const code = ar ? ar.status : 0;
         if(code===401 || code===403 || (ar && ar.errors && ar.errors[0] && ar.errors[0].code===10000)){
@@ -4199,7 +4232,7 @@ function renderStaticJS(env) {
         const emailLine = document.createElement('div'); emailLine.style.cssText = 'font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap';
         emailLine.appendChild(document.createTextNode(acctLabel(a)));
         if (isActive) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = '执行账号'; emailLine.appendChild(b); }
-        if (isOa) { const b = document.createElement('span'); b.style.cssText = 'font-size:11px;background:#eef2ff;color:#3730a3;border-radius:4px;padding:1px 6px'; b.textContent = 'OAuth 授权'; emailLine.appendChild(b); }
+        if (isOa) { const b = document.createElement('span'); b.style.cssText = 'font-size:11px;background:#eef2ff;color:#3730a3;border-radius:4px;padding:1px 6px'; b.textContent = (a && a.key) ? 'Key + OAuth' : 'OAuth 授权'; emailLine.appendChild(b); }
         if (a.group) { const g = document.createElement('span'); g.style.cssText = 'font-size:11px;background:#eef2ff;color:#3730a3;border-radius:4px;padding:1px 6px'; g.textContent = a.group; emailLine.appendChild(g); }
         const st2 = document.createElement('span'); st2.style.cssText = 'font-size:11px;color:' + st.c; st2.textContent = st.t; emailLine.appendChild(st2);
         const meta = document.createElement('div'); meta.className = 'small'; meta.style.cssText = 'margin:0;color:#94a3b8';
@@ -4913,14 +4946,24 @@ function renderStaticJS(env) {
       else showNotification((r && r.error) || '无法生成授权地址：请先保存 OAuth 配置', 'error');
     }
     async function oauthDisconnect(oauthId){
-      confirmDialog('断开该 OAuth 连接？面板将删除其令牌；如需在 Cloudflare 侧彻底撤销授权，请到 dash → My Profile → 授权应用。', async () => {
+      confirmDialog('断开该账号的 OAuth 授权？仅移除 OAuth 令牌' + (true ? '' : '') + '；若账号同时存有 Global Key 将保留，仍可用 Key 通道管理。如需在 Cloudflare 侧彻底撤销，请到 dash → My Profile → 授权应用。', async () => {
         const r = await api('oauth-revoke-account', { oauthId });
         const arr = loadSaved();
         const i = arr.findIndex(a => a && a.oauth && a.oauthId === oauthId);
-        if (i !== -1) arr.splice(i, 1);
-        localStorage.setItem('cf_accounts', JSON.stringify(arr));
+        if (i !== -1) {
+          const rec = arr[i];
+          if (rec && rec.key) {
+            // 双通道：降级为纯 Global Key 账号
+            const keyRec = { email: rec.email || '', key: rec.key, group: rec.group || '', added: rec.added || '', status: 'ok' };
+            arr.splice(i, 1, keyRec);
+          } else {
+            arr.splice(i, 1);
+          }
+        }
         if (getActiveCreds().oauthId === oauthId) localStorage.removeItem('cf_active_oauth');
-        if (r && r.success) showNotification('已断开 OAuth 连接'); else showNotification('本地已移除（服务端断开失败：' + ((r && r.error) || '未知') + '）', 'error');
+        localStorage.setItem('cf_accounts', JSON.stringify(arr));
+        saveAccounts(arr);
+        if (r && r.success) showNotification('已断开 OAuth（Global Key 保留可用）'); else showNotification('服务端断开失败：' + ((r && r.error) || '未知'), 'error');
         renderAccounts(); loadOAuthUI(); updateAcctBadge();
       });
     }
