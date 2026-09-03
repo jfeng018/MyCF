@@ -2099,7 +2099,11 @@ async function storeDailySnapshots(env){
 
 // ---- 账号 HTTP 分析采集（请求/带宽/访问者，GraphQL zones 24h；写入 an_snap + an_daily）----
 
-async function cfZonesOfAccount(email, key, accountId, cap = 80){
+async function cfZonesOfAccount(env, email, key, accountId, cap = 80){
+  const ck = 'zl_' + accountId;
+  try {
+    if (env && env.CF_ACCOUNTS_KV) { const raw = await env.CF_ACCOUNTS_KV.get(ck); if (raw) { const o = JSON.parse(raw); if (o && o.t && Date.now() - o.t < 600000 && o.tags) return o; } }
+  } catch(e){}
   const tags = [], names = {};
   try {
     for (let pg = 1; pg <= 6; pg++){
@@ -2111,6 +2115,7 @@ async function cfZonesOfAccount(email, key, accountId, cap = 80){
       if (!added) break;
     }
   } catch(e){}
+  try { if (env && env.CF_ACCOUNTS_KV) await env.CF_ACCOUNTS_KV.put(ck, JSON.stringify({ t: Date.now(), tags, names })); } catch(e){}
   return { tags, names };
 }
 
@@ -2129,7 +2134,7 @@ async function storeAnalytics(env){
       if(!key){ fail++; continue; }
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
       if(!accountId){ fail++; continue; }
-      const zlist = await cfZonesOfAccount(email, key, accountId).catch(() => ({ tags: [], names: {} }));
+      const zlist = await cfZonesOfAccount(env, email, key, accountId).catch(() => ({ tags: [], names: {} }));
       const zq = 'query($zid:String!,$st:Time!,$et:Time!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetime}sum{requests bytes}uniq{uniques}} country:httpRequestsAdaptiveGroups(limit:80,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{clientCountryName}} status:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{edgeResponseStatus}} colo:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{coloCode}}}}}}';
       const zones = [];
       let _anErr = '';
@@ -2195,7 +2200,7 @@ async function storeOfficialAnalytics(env, days = 92){
       if(!key){ fail++; continue; }
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
       if(!accountId){ fail++; continue; }
-      const zlist = await cfZonesOfAccount(email, key, accountId).catch(() => ({ tags: [], names: {} }));
+      const zlist = await cfZonesOfAccount(env, email, key, accountId).catch(() => ({ tags: [], names: {} }));
       const zq = 'query($zid:String!,$ge:Date!,$le:Date!){viewer{zones(filter:{zoneTag:$zid}){zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:$ge,date_leq:$le}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}';
       const zones = [];
       let _anErr = '';
@@ -2291,7 +2296,11 @@ function computeAccountTrends(history, days){
   for (const d of dates) {
     for (const r of (history[d]||[])) {
       const key = r.email || r.accountId || 'unknown';
-      if (!map[key]) map[key] = { email:key, name:r.name||maskEmail(key), byDate:{} };
+      if (!map[key]) {
+        const masked = key.indexOf('@') !== -1 ? maskEmail(key) : key;
+        const nm = r.name ? (r.name + ' · ' + masked) : masked;
+        map[key] = { email:key, name:nm, byDate:{} };
+      }
       map[key].byDate[d] = (map[key].byDate[d]||0) + (r.total||0);
     }
   }
