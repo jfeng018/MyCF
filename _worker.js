@@ -2100,17 +2100,16 @@ async function storeDailySnapshots(env){
 // ---- 账号 HTTP 分析采集（请求/带宽/访问者，GraphQL zones 24h；写入 an_snap + an_daily）----
 
 async function cfZonesOfAccount(env, email, key, accountId, cap = 80){
-  const ck = 'zl2_' + accountId;
+  // 收集该凭据(REST /zones)可见的全部 zone，不按 accountId 过滤：
+  // /zones 跨账号返回，账号库里存的 accountId 不一定是 zone 归属的账号（常见多账号：主账号无 zone、有 zone 的在另一账号）
+  // 缓存键用 email 标识凭据，避免多个凭据共享同一 accountId 时缓存互串
+  const ck = 'zl3_' + email;
   let cached = null;
   try {
     if (env && env.CF_ACCOUNTS_KV) { const raw = await env.CF_ACCOUNTS_KV.get(ck); if (raw) { const o = JSON.parse(raw); if (o && o.t && Array.isArray(o.tags) && o.ok) cached = o; } }
   } catch(e){}
-  if (cached) {
-    // matched=0 但 REST 有 zone(疑似 accountId 指错)时缩短 TTL，便于修复后快速生效
-    const ttl = (cached.meta && cached.meta.total > 0 && cached.meta.matched === 0) ? 300000 : 600000;
-    if (Date.now() - cached.t < ttl) return { tags: cached.tags, names: cached.names, meta: cached.meta || null };
-  }
-  const tags = [], names = {}; let fault = ''; let total = 0; const seen = {};
+  if (cached && Date.now() - cached.t < 600000) return { tags: cached.tags, names: cached.names, meta: cached.meta || null };
+  const tags = [], names = {}; let fault = ''; let total = 0; const accts = {};
   try {
     for (let pg = 1; pg <= 6; pg++){
       const r = await cfGet('/zones?per_page=50&page=' + pg, email, key).catch(()=>null);
@@ -2119,15 +2118,14 @@ async function cfZonesOfAccount(env, email, key, accountId, cap = 80){
       for (const z of arr){
         if (!z || !z.id) continue;
         total++;
-        if (z.account && z.account.id) { const s = seen[z.account.id] = seen[z.account.id] || { n: 0, name: z.account.name || '' }; s.n++; }
-        if (z.account && z.account.id === accountId && !names[z.id]) { if (tags.length < cap) tags.push(z.id); names[z.id] = z.name || z.id; }
+        if (z.account && z.account.id) { const s = accts[z.account.id] = accts[z.account.id] || { n: 0, name: z.account.name || '' }; s.n++; }
+        if (!names[z.id]) { if (tags.length < cap) tags.push(z.id); names[z.id] = z.name || z.id; }
       }
       const ri = r.result_info;
-      // 翻完整页：/zones 跨账号返回且不按 account 分组，不能在无匹配页提前 break
       if (arr.length < 50 || (ri && ri.total_pages != null && pg >= ri.total_pages)) break;
     }
   } catch(e){ fault = 'REST /zones error'; }
-  const meta = { total, matched: tags.length, want: accountId, seen: Object.keys(seen).map(k => ({ id: k, name: seen[k].name, n: seen[k].n })).sort((a, b) => b.n - a.n).slice(0, 3) };
+  const meta = { total, matched: tags.length, accts: Object.keys(accts).map(k => ({ id: k, name: accts[k].name, n: accts[k].n })).sort((a, b) => b.n - a.n).slice(0, 3) };
   if (fault) { if (cached) return { tags: cached.tags, names: cached.names, meta: cached.meta || meta }; return { tags, names, fault, meta }; }
   try { if (env && env.CF_ACCOUNTS_KV) await env.CF_ACCOUNTS_KV.put(ck, JSON.stringify({ t: Date.now(), ok: true, tags, names, meta })); } catch(e){}
   return { tags, names, meta };
@@ -2163,8 +2161,8 @@ async function storeAnalytics(env){
       }
       if (!zones.length && !_anErr) {
         if (zlist.fault) _anErr = zlist.fault;
-        else if (zlist.meta && zlist.meta.total > 0) _anErr = 'REST /zones 共 ' + zlist.meta.total + ' 个 zone 均属其他账号(' + zlist.meta.seen.map(s => s.name || s.id).join(', ') + ')，非期望 accountId=' + zlist.meta.want;
-        else if (zlist.meta) _anErr = '该凭据下无 zone(REST /zones 返回 0)';
+        else if (zlist.meta && zlist.meta.total === 0) _anErr = '该凭据下无 zone(REST /zones 返回 0)';
+        else if (zlist.meta && zlist.meta.total > 0) _anErr = 'REST 取到 ' + zlist.meta.total + ' 个 zone，但逐 zone GraphQL 未返回数据';
         else _anErr = '未取到 zones(逐 zone 查询为空)';
       }
       const hourMap = {}; const cmap = {}, smap = {}, lmap = {}; let req = 0, bytes = 0, uniq = 0;
@@ -2234,8 +2232,8 @@ async function storeOfficialAnalytics(env, days = 92){
       }
       if (!zones.length && !_anErr) {
         if (zlist.fault) _anErr = zlist.fault;
-        else if (zlist.meta && zlist.meta.total > 0) _anErr = 'REST /zones 共 ' + zlist.meta.total + ' 个 zone 均属其他账号(' + zlist.meta.seen.map(s => s.name || s.id).join(', ') + ')，非期望 accountId=' + zlist.meta.want;
-        else if (zlist.meta) _anErr = '该凭据下无 zone(REST /zones 返回 0)';
+        else if (zlist.meta && zlist.meta.total === 0) _anErr = '该凭据下无 zone(REST /zones 返回 0)';
+        else if (zlist.meta && zlist.meta.total > 0) _anErr = 'REST 取到 ' + zlist.meta.total + ' 个 zone，但逐 zone GraphQL 未返回数据';
         else _anErr = '未取到 zones(逐 zone 查询为空)';
       }
       const dayMap = {};
