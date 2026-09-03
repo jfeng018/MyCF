@@ -199,7 +199,11 @@ async function handleAPI(req, env) {
     // WAF 自定义规则 / 隧道 / 批量重定向
     'list-waf-rules','create-waf-entrypoint','create-waf-rule','update-waf-rule','delete-waf-rule',
     'list-tunnels','create-tunnel','get-tunnel-token','get-tunnel-connections','delete-tunnel',
-    'list-redirect-lists','create-redirect-list','delete-redirect-list','list-redirect-items','add-redirect-items','delete-redirect-item','get-redirect-rules','save-redirect-rules'
+    'list-redirect-lists','create-redirect-list','delete-redirect-list','list-redirect-items','add-redirect-items','delete-redirect-item','get-redirect-rules','save-redirect-rules',
+    // 站点优化 / 邮箱转发 / DNS IO / R2 / 流量
+    'get-zone-settings','set-zone-setting','list-cache-rules','save-cache-rules',
+    'get-email-routing','set-email-routing','add-email-rule','update-email-rule','delete-email-rule',
+    'export-dns','import-dns','list-r2-buckets','get-zone-analytics'
   ]);
 
   // 资源类 action 的 OAuth 会话解析：前端仅提交 oauthId，后端解密 token 注入为 Bearer（key=__oa_+token）
@@ -991,6 +995,120 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
           r = await cfPost(`/accounts/${accountId}/rulesets`, payload.email, payload.key, { name: 'Bulk Redirects', kind: 'root', phase: 'http_request_redirect', description: 'MyCF bulk redirects', rules });
         }
         return json(r.success ? { success: true, rules: (r.result && r.result.rules) || rules } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '保存重定向规则失败' });
+      }
+
+      // ===== Zone 安全设置 =====
+      case 'get-zone-settings': {
+        const zoneId = payload.zoneId;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const r = await cfGet(`/zones/${zoneId}/settings`, payload.email, payload.key);
+        if (!r.success || !r.result) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取设置失败' });
+        const pick = ['always_use_https','min_tls_version','ssl','tls_1_3','0rtt','http2','http3','brotli','websockets','opportunistic_encryption','automatic_https_rewrites','ipv6','image_resizing','hotlink_protection','security_level','challenge_ttl','browser_check','email_obfuscation','server_side_exclude'];
+        const map = {};
+        (r.result || []).forEach(s => { if (s && s.id && pick.indexOf(s.id) !== -1) map[s.id] = { value: s.value, editable: s.editable !== false }; });
+        return json({ success: true, settings: map });
+      }
+      case 'set-zone-setting': {
+        const { zoneId, name, value } = payload;
+        if (!zoneId || !name) return json({ success: false, error: 'zoneId & name required' }, 400);
+        const r = await cfAny('PATCH', `/zones/${zoneId}/settings/${encodeURIComponent(name)}`, payload.email, payload.key, { value });
+        return json(r.success ? { success: true } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '设置失败' });
+      }
+      case 'list-cache-rules': {
+        const zoneId = payload.zoneId;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const r = await cfGet(`/zones/${zoneId}/rulesets/phases/http_request_cache_settings/entrypoint`, payload.email, payload.key);
+        if (!r.success || !r.result) {
+          if (r.status === 404) return json({ success: true, exists: false, rules: [] });
+          return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取缓存规则失败' });
+        }
+        return json({ success: true, exists: true, rules: r.result.rules || [] });
+      }
+      case 'save-cache-rules': {
+        const zoneId = payload.zoneId; const rules = payload.rules || [];
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const probe = await cfGet(`/zones/${zoneId}/rulesets/phases/http_request_cache_settings/entrypoint`, payload.email, payload.key);
+        let r;
+        if (probe && probe.success && probe.result) {
+          r = await cfAny('PUT', `/zones/${zoneId}/rulesets/phases/http_request_cache_settings/entrypoint`, payload.email, payload.key, { rules });
+        } else {
+          r = await cfPost(`/zones/${zoneId}/rulesets`, payload.email, payload.key, { name: 'Cache Rules', kind: 'zone', phase: 'http_request_cache_settings', description: 'MyCF cache rules', rules });
+        }
+        return json(r.success ? { success: true, rules: (r.result && r.result.rules) || rules } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '保存缓存规则失败' });
+      }
+
+      // ===== Email Routing =====
+      case 'get-email-routing': {
+        const zoneId = payload.zoneId;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const out = { enabled: false, zoneName: '', rules: [], addresses: [] };
+        try { const s = await cfGet(`/zones/${zoneId}/email/routing`, payload.email, payload.key); if (s && s.success && s.result) { out.enabled = !!s.result.enabled; out.zoneName = s.result.name || ''; } } catch(e){}
+        try { const rr = await cfGet(`/zones/${zoneId}/email/routing/rules`, payload.email, payload.key); if (rr && rr.success && Array.isArray(rr.result)) out.rules = rr.result; } catch(e){}
+        try { const ad = await cfGet(`/accounts/${accountId}/email/routing/addresses?per_page=1000`, payload.email, payload.key); if (ad && ad.success && Array.isArray(ad.result)) out.addresses = ad.result; } catch(e){}
+        return json({ success: true, email: out });
+      }
+      case 'set-email-routing': {
+        const zoneId = payload.zoneId; const enabled = !!payload.enabled;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const r = await cfPost(`/zones/${zoneId}/email/routing/${enabled ? 'enable' : 'disable'}`, payload.email, payload.key, {});
+        return json(r.success ? { success: true, enabled } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '切换失败' });
+      }
+      case 'add-email-rule': {
+        const { zoneId, rule } = payload;
+        if (!zoneId || !rule) return json({ success: false, error: 'zoneId & rule required' }, 400);
+        const r = await cfPost(`/zones/${zoneId}/email/routing/rules`, payload.email, payload.key, rule);
+        return json(r.success ? { success: true, rule: r.result } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '添加规则失败' });
+      }
+      case 'update-email-rule': {
+        const { zoneId, ruleId, rule } = payload;
+        if (!zoneId || !ruleId || !rule) return json({ success: false, error: 'zoneId/ruleId/rule required' }, 400);
+        const r = await cfAny('PUT', `/zones/${zoneId}/email/routing/rules/${ruleId}`, payload.email, payload.key, rule);
+        return json(r.success ? { success: true } : { success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '更新规则失败' });
+      }
+      case 'delete-email-rule': {
+        const { zoneId, ruleId } = payload;
+        if (!zoneId || !ruleId) return json({ success: false, error: 'zoneId & ruleId required' }, 400);
+        const r = await cfAny('DELETE', `/zones/${zoneId}/email/routing/rules/${ruleId}`, payload.email, payload.key);
+        return json({ success: r.success, error: r.success ? undefined : ((r.errors && r.errors[0] && r.errors[0].message) || '删除规则失败') });
+      }
+
+      // ===== DNS 导入导出 / R2 / Zone 流量 =====
+      case 'export-dns': {
+        const zoneId = payload.zoneId;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        const r = await fetch(`${CF_API_BASE}/zones/${zoneId}/dns_records/export`, { method: 'GET', headers: cfHeaders(payload.email, payload.key) });
+        if (!r.ok) return json({ success: false, error: '导出失败 HTTP ' + r.status });
+        return json({ success: true, text: await r.text() });
+      }
+      case 'import-dns': {
+        const { zoneId, bindText, proxied } = payload;
+        if (!zoneId || !bindText) return json({ success: false, error: 'zoneId & bindText required' }, 400);
+        const fd = new FormData();
+        fd.append('file', new Blob([bindText], { type: 'text/bind' }), 'import.txt');
+        if (proxied) fd.append('proxied', 'true');
+        const r = await fetch(`${CF_API_BASE}/zones/${zoneId}/dns_records/import`, { method: 'POST', headers: cfHeaders(payload.email, payload.key), body: fd });
+        const data = await r.json().catch(() => ({}));
+        return json({ success: r.ok && data.success !== false, result: data.result || null, error: r.ok ? undefined : ((data.errors && data.errors[0] && data.errors[0].message) || '导入失败 HTTP ' + r.status) });
+      }
+      case 'list-r2-buckets': {
+        const accountId = payload.accountId || await getAccountId(payload.email, payload.key);
+        const r = await cfGet(`/accounts/${accountId}/r2/buckets?per_page=1000`, payload.email, payload.key);
+        if (!r.success) return json({ success: false, error: (r.errors && r.errors[0] && r.errors[0].message) || '获取 R2 桶失败' });
+        return json({ success: true, buckets: r.result || [] });
+      }
+      case 'get-zone-analytics': {
+        const { zoneId } = payload;
+        if (!zoneId) return json({ success: false, error: 'zoneId required' }, 400);
+        try {
+          const end = new Date(); const start = new Date(Date.now() - 24 * 3600 * 1000);
+          const q = `query Z($tag:String!,$st:Time!,$et:Time!){viewer{zones(filter:{zoneTag:$tag}){httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetimeHour}sum{requests bytes}uniq{uniques}}}}}`
+          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, cfHeaders(payload.email, payload.key)), body: JSON.stringify({ query: q, variables: { tag: zoneId, st: start.toISOString(), et: end.toISOString() } }) });
+          const res = await g.json();
+          const zone = res && res.data && res.data.viewer && res.data.viewer.zones && res.data.viewer.zones[0];
+          const groups = (zone && zone.httpRequests1hGroups) || [];
+          return json({ success: true, groups });
+        } catch(e){ return json({ success: false, error: '流量查询失败：' + e.message }); }
       }
 
       case 'save-tg-config': {
@@ -2387,6 +2505,9 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
       <div class="item" data-page="waf" onclick="navTo('waf')">WAF 规则</div>
       <div class="item" data-page="tunnels" onclick="navTo('tunnels')">隧道 Tunnel</div>
       <div class="item" data-page="redirects" onclick="navTo('redirects')">批量重定向</div>
+      <div class="item" data-page="optimize" onclick="navTo('optimize')">站点优化</div>
+      <div class="item" data-page="email" onclick="navTo('email')">邮箱转发</div>
+      <div class="item" data-page="r2" onclick="navTo('r2')">R2 存储</div>
       <div class="item" data-page="batch" onclick="navTo('batch')">批量创建 Worker</div>
       <div class="item" data-page="pages" onclick="navTo('pages')">批量部署 Pages</div>
       <div class="item" data-page="bulk" onclick="navTo('bulk')">批量操作</div>
@@ -2697,6 +2818,7 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <div style="font-size:20px;font-weight:700">域名管理</div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <input id="zoneSearch" class="input list-search" placeholder="搜索域名" oninput="filterRows('zonesList', this.value)">
+          <button class="btn" onclick="openDnsExportImport()">导出/导入 BIND</button>
           <button class="btn primary" onclick="openAddZone()">添加新域名</button>
         </div>
       </div>
@@ -2985,6 +3107,72 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
       </div>
     </div>
 
+    <!-- Optimize Page（资源 · Zone 安全/缓存/流量） -->
+    <div id="optimize-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">站点优化</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="optZoneSel" class="input" style="min-width:220px" onchange="loadOptimizePage()"></select>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <h3 style="margin:0">安全与性能设置</h3>
+          <button class="btn" onclick="zoneHarden()">一键加固（HTTPS + 最低 TLS1.2）</button>
+        </div>
+        <div id="zoneSettingsBox" class="small" style="margin-top:10px;font-family:monospace">加载中…</div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <h3 style="margin:0">Cache Rules 缓存规则 <span style="font-weight:400;font-size:12px;color:#64748b">免费额度 10 条</span></h3>
+          <button class="btn primary" onclick="openCacheRuleModal()">新建规则</button>
+        </div>
+        <div id="cacheRuleList" class="small" style="margin-top:10px">加载中…</div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3 style="margin:0">24 小时流量 <span style="font-weight:400;font-size:12px;color:#64748b">GraphQL 免费额度</span></h3>
+        <div id="zoneAnalyticsBox" class="small" style="margin-top:10px;font-family:monospace">加载中…</div>
+      </div>
+    </div>
+
+    <!-- Email Routing Page（资源 · 需执行账号） -->
+    <div id="email-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">邮箱转发 Email Routing</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="emailZoneSel" class="input" style="min-width:220px" onchange="loadEmailPage()"></select>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <h3 style="margin:0">路由开关</h3>
+          <label style="display:flex;align-items:center;gap:8px;color:#475569"><input id="emailRoutingToggle" type="checkbox" onchange="setEmailRouting(this.checked)"> 启用接收</label>
+        </div>
+        <div class="small" style="margin-top:6px;line-height:1.8" id="emailHintBox"></div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <h3 style="margin:0">转发规则</h3>
+          <button class="btn primary" onclick="openEmailRuleModal()">新建规则</button>
+        </div>
+        <div id="emailRuleList" class="small" style="margin-top:10px">加载中…</div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3 style="margin:0">目标地址（已验证收件邮箱）</h3>
+        <div id="emailAddrList" class="small" style="margin-top:10px;font-family:monospace">加载中…</div>
+      </div>
+    </div>
+
+    <!-- R2 Page（资源 · 桶列表） -->
+    <div id="r2-page" class="page-content">
+      <div class="header">
+        <div style="font-size:20px;font-weight:700">R2 对象存储</div>
+        <button class="btn" onclick="loadR2Page()">刷新</button>
+      </div>
+      <div class="small" style="margin:4px 0 12px;line-height:1.8">桶级管理。桶内对象上传/下载需账号级 R2 API Token（S3 签名，Global Key 无法做对象级操作）——可在 Cloudflare 创建 token 后在此列表基础上自行扩展。</div>
+      <div id="r2BucketList" class="small" style="font-family:monospace">加载中…</div>
+    </div>
+
     <div id="bulk-page" class="page-content">
       <div class="header"><div style="font-size:20px;font-weight:700">批量操作</div></div>
       <div class="grid">
@@ -3012,6 +3200,76 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
     </div>
 
 <!-- Modals -->
+<div id="dnsIOModal" class="modal"><div class="modal-box" style="max-width:720px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 style="margin:0">DNS 导出 / 导入（BIND 格式）</h3>
+    <button class="trash-btn" onclick="closeModal('dnsIOModal')">✕</button>
+  </div>
+  <select id="dnsIoZoneSel" class="input"></select>
+  <div style="display:flex;gap:8px;margin:10px 0;flex-wrap:wrap">
+    <button class="btn primary" onclick="exportDnsNow()">导出该域名 BIND</button>
+    <button class="btn" onclick="downloadExportedDns()">下载 .txt</button>
+  </div>
+  <textarea id="dnsIoOut" class="input" style="min-height:130px;font-family:monospace" placeholder="导出内容会显示在这里…"></textarea>
+  <hr style="margin:12px 0">
+  <div class="small" style="margin-bottom:6px">导入（覆盖式追加，冲突记录会跳过）</div>
+  <textarea id="dnsIoIn" class="input" style="min-height:110px;font-family:monospace" placeholder="example.com. 300 IN A 1.2.3.4&#10;@ IN MX 10 mail.example.com."></textarea>
+  <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+    <label style="display:flex;align-items:center;gap:6px;color:#475569"><input id="dnsIoProxied" type="checkbox"> 代理(橙色云)</label>
+    <button class="btn primary" onclick="importDnsNow()">开始导入</button>
+    <span id="dnsIoResult" class="small"></span>
+  </div>
+</div></div>
+
+<div id="cacheRuleModal" class="modal"><div class="modal-box">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 id="cacheRuleModalTitle" style="margin:0">新建缓存规则</h3>
+    <button class="trash-btn" onclick="closeModal('cacheRuleModal')">✕</button>
+  </div>
+  <div class="small" style="margin-bottom:4px">匹配表达式</div>
+  <textarea id="crExpr" class="input" style="min-height:56px;font-family:monospace" placeholder='(http.host eq "cdn.example.com")'></textarea>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px">
+    <label style="display:flex;align-items:center;gap:6px;color:#475569"><input id="crCache" type="checkbox" checked> 可缓存</label>
+    <select id="crTtlMode" class="input" style="width:auto">
+      <option value="">沿用来源(不设 TTL)</option>
+      <option value="respect_origin">尊重源站 Cache-Control</option>
+      <option value="bypass_by_default">默认绕过(不缓存)</option>
+      <option value="override_origin">覆盖源站 TTL</option>
+      <option value="set_ttl">固定 TTL</option>
+    </select>
+    <input id="crTtlSec" class="input" type="number" min="0" placeholder="TTL 秒" style="width:110px">
+  </div>
+  <input id="crDesc" class="input" style="margin-top:8px" placeholder="描述（可选）">
+  <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn" onclick="closeModal('cacheRuleModal')">取消</button>
+    <button class="btn primary" onclick="saveCacheRule()">保存</button>
+  </div>
+</div></div>
+
+<div id="emailRuleModal" class="modal"><div class="modal-box">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h3 id="emailRuleModalTitle" style="margin:0">新建转发规则</h3>
+    <button class="trash-btn" onclick="closeModal('emailRuleModal')">✕</button>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <select id="erMatchType" class="input" style="width:auto">
+      <option value="literal">指定地址</option>
+      <option value="all">Catch-all 全部收件</option>
+    </select>
+    <input id="erAddress" class="input" style="flex:1;min-width:180px" placeholder="info@你的域名">
+    <select id="erAction" class="input" style="width:auto">
+      <option value="forward">转发到</option>
+      <option value="drop">丢弃</option>
+    </select>
+    <input id="erTargets" class="input" style="flex:1;min-width:180px" placeholder="目标邮箱（多个用逗号分隔）">
+  </div>
+  <div class="small" style="margin:6px 0">目标邮箱需先在账号内验证（面板下方列表展示已验证地址）。</div>
+  <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+    <button class="btn" onclick="closeModal('emailRuleModal')">取消</button>
+    <button class="btn primary" onclick="saveEmailRule()">保存</button>
+  </div>
+</div></div>
+
 <div id="wafRuleModal" class="modal"><div class="modal-box">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
     <h3 id="wafRuleModalTitle" style="margin:0">新建 WAF 规则</h3>
@@ -3604,7 +3862,7 @@ function renderStaticJS(env) {
     function goAccounts(){ closeAccountSwitcher(); navTo('accounts'); }
 
     // 两级结构：资源页需要"执行账号"，未选择时先引导（不再影响全局页）
-    const RESOURCE_PAGES = ['workers','pages-manager','snippets','kv','d1','dns','waf','tunnels','redirects','batch','pages','bulk'];
+    const RESOURCE_PAGES = ['workers','pages-manager','snippets','kv','d1','dns','waf','tunnels','redirects','optimize','email','r2','batch','pages','bulk'];
     function ensureAccount(){
       const a = getActiveCreds();
       if (a.oauthId || (a.email && a.key)) return true;
@@ -3630,6 +3888,7 @@ function renderStaticJS(env) {
         case 'd1': refreshD1Databases(); break;
         case 'dns': showZonesList(); break; case 'snippets': showSnippetsZonesList(); break;
         case 'waf': loadWafPage(); break; case 'tunnels': loadTunnelsPage(); break; case 'redirects': loadRedirectsPage(); break;
+        case 'optimize': loadOptimizePage(); break; case 'email': loadEmailPage(); break; case 'r2': loadR2Page(); break;
         case 'monitor': loadMonitor(); break; case 'bulk': renderBulkAccounts(); renderBulkZones(); break;
         case 'settings': loadSettingsAll(); break;
       }
@@ -4083,6 +4342,282 @@ function renderStaticJS(env) {
     window.openTunnelModal = openTunnelModal; window.createTunnel = createTunnel; window.showTunnelCmd = showTunnelCmd; window.deleteTunnel = deleteTunnel; window.copyCmd = copyCmd; window.closeCmdOverlay = closeCmdOverlay;
     window.openRedirectListModal = openRedirectListModal; window.createRedirectList = createRedirectList; window.deleteRedirectList = deleteRedirectList; window.viewRedirectItems = viewRedirectItems; window.addRedirectItems = addRedirectItems; window.deleteRedirectItem = deleteRedirectItem;
     window.openRedirectEnable = openRedirectEnable; window.enableRedirectList = enableRedirectList; window.enableRedirectListFrom = enableRedirectListFrom; window.toggleRedirectRule = toggleRedirectRule; window.removeRedirectRule = removeRedirectRule;
+
+    // ===== 第四批：站点优化 / 邮箱转发 / DNS IO / R2 =====
+    const ctx4 = { cacheRules: [], cacheEdit: null, email: null, dnsZone: '' };
+    const ZONE_LABELS = { always_use_https:'强制 HTTPS', min_tls_version:'最低 TLS 版本', ssl:'SSL 模式', tls_1_3:'TLS 1.3', '0rtt':'0-RTT', http2:'HTTP/2', http3:'HTTP/3', brotli:'Brotli 压缩', websockets:'WebSocket', opportunistic_encryption:'机会性加密', automatic_https_rewrites:'自动 HTTPS 重写', ipv6:'IPv6', hotlink_protection:'防盗链', email_obfuscation:'邮箱混淆', browser_check:'浏览器完整性检查', security_level:'安全级别', challenge_ttl:'验证码有效期(秒)' };
+    const ZONE_SWITCHES = ['always_use_https','tls_1_3','0rtt','http2','http3','brotli','websockets','opportunistic_encryption','automatic_https_rewrites','ipv6','hotlink_protection','email_obfuscation','browser_check'];
+    const ZONE_SELECTS = { min_tls_version:['1.0','1.1','1.2','1.3'], ssl:['off','flexible','full','strict'], security_level:['essentially_off','low','medium','high','under_attack'] };
+    async function fillZoneSel(selId, key){
+      const sel = el(selId); if (!sel) return;
+      try {
+        const r = await api('list-zones', {});
+        if (r && r.success && Array.isArray(r.result) && r.result.length) {
+          sel.innerHTML = r.result.map(z => '<option value="' + escAttr(z.id) + '">' + escAttr(z.name) + '</option>').join('');
+          const saved = localStorage.getItem(key);
+          sel.value = (saved && r.result.find(z => z.id === saved)) ? saved : r.result[0].id;
+          localStorage.setItem(key, sel.value);
+        } else sel.innerHTML = '<option value="">无可用域名</option>';
+      } catch(e){}
+    }
+    function zoneChips(s){
+      return '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px dashed #eef2f6"><span style="display:inline-block;width:170px;color:#334155;flex:0 0 auto">' + s + '</span>';
+    }
+    async function loadOptimizePage(){ await fillZoneSel('optZoneSel', 'opt_zone'); loadZoneSettings(); loadCacheRules(); loadZoneAnalytics(); }
+    async function loadZoneSettings(){
+      const box = el('zoneSettingsBox'); const z = el('optZoneSel').value;
+      if (!z) { box.innerHTML = ''; return; }
+      box.textContent = '加载中…';
+      const r = await api('get-zone-settings', { zoneId: z });
+      if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</span>'; return; }
+      const st = r.settings || {}; let html = '';
+      for (const id of Object.keys(ZONE_LABELS)) {
+        const it = st[id]; if (!it) continue;
+        const lbl = escAttr(ZONE_LABELS[id]);
+        if (ZONE_SWITCHES.indexOf(id) !== -1) {
+          const on = it.value === 'on';
+          html += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px dashed #eef2f6"><span style="display:inline-block;width:170px;color:#334155;flex:0 0 auto">' + lbl + '</span>' +
+            '<label class="switch"><input type="checkbox" ' + (on ? 'checked' : '') + (it.editable ? '' : ' disabled') + ' onchange="setZoneSetting(\\'' + id + '\\', this.checked ? \\'on\\' : \\'off\\')"><span class="slider"></span></label></div>';
+        } else if (ZONE_SELECTS[id]) {
+          const opts = ZONE_SELECTS[id].map(o => '<option value="' + o + '"' + (it.value === o ? ' selected' : '') + '>' + o + '</option>').join('');
+          html += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px dashed #eef2f6"><span style="display:inline-block;width:170px;color:#334155;flex:0 0 auto">' + lbl + '</span>' +
+            '<select style="width:auto" ' + (it.editable ? '' : ' disabled') + ' onchange="setZoneSetting(\\'' + id + '\\', this.value)">' + opts + '</select></div>';
+        } else {
+          html += '<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px dashed #eef2f6"><span style="display:inline-block;width:170px;color:#334155;flex:0 0 auto">' + lbl + '</span>' +
+            '<input class="input" style="width:120px" value="' + escAttr(it.value) + '"' + (it.editable ? '' : ' disabled') + ' onchange="setZoneSetting(\\'' + id + '\\', this.value)"></div>';
+        }
+      }
+      box.innerHTML = html || '<span style="color:#94a3b8">（白名单设置项不可用）</span>';
+    }
+    async function setZoneSetting(name, value){
+      const zoneId = el('optZoneSel').value;
+      const r = await api('set-zone-setting', { zoneId, name, value });
+      if (r && r.success) { showNotification(ZONE_LABELS[name] + ' = ' + value); }
+      else { showNotification((r && r.error) || '设置失败', 'error'); loadZoneSettings(); }
+    }
+    async function zoneHarden(){
+      const zoneId = el('optZoneSel').value;
+      if (!zoneId) return showNotification('请先选择域名', 'error');
+      const steps = [['always_use_https','on'], ['min_tls_version','1.2'], ['automatic_https_rewrites','on']];
+      showNotification('执行一键加固…');
+      for (const [name, value] of steps) {
+        const r = await api('set-zone-setting', { zoneId, name, value });
+        if (!r || !r.success) { showNotification('「' + ZONE_LABELS[name] + '」失败：' + ((r && r.error) || ''), 'error'); }
+      }
+      showNotification('一键加固完成（强制 HTTPS + 最低 TLS1.2 + 自动重写）');
+      loadZoneSettings();
+    }
+    async function loadCacheRules(){
+      const box = el('cacheRuleList'); const zoneId = el('optZoneSel').value;
+      if (!zoneId) { box.innerHTML = ''; return; }
+      box.innerHTML = '<span style="color:#94a3b8">加载中…</span>';
+      const r = await api('list-cache-rules', { zoneId });
+      if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</span>'; return; }
+      ctx4.cacheRules = r.rules || [];
+      renderCacheRules();
+    }
+    function renderCacheRules(){
+      const box = el('cacheRuleList');
+      if (!ctx4.cacheRules.length) { box.innerHTML = '<span style="color:#94a3b8">暂无缓存规则 —— 免费额度 10 条</span>'; return; }
+      box.innerHTML = ctx4.cacheRules.map((rule, i) => {
+        const on = rule.enabled !== false;
+        const ap = rule.action_parameters || {};
+        const ttlMode = (ap.edge_ttl && ap.edge_ttl.mode) || '';
+        const desc = [ap.cache === false ? '不缓存' : (ap.cache === true ? '缓存' : ''), ttlMode ? ('TTL:' + ttlMode + (ap.edge_ttl.ttl ? ' ' + ap.edge_ttl.ttl + 's' : '')) : ''].filter(Boolean).join(' · ');
+        return '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">' +
+          '<div style="flex:1;min-width:200px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><b style="font-size:13px">' + escAttr(rule.description || '缓存规则') + '</b> ' + (on ? '<span style="color:#0f6e56;font-size:12px">启用</span>' : '<span style="color:#94a3b8;font-size:12px">停用</span>') + (desc ? '<span style="color:#64748b;font-size:12px">' + escAttr(desc) + '</span>' : '') + '</div>' +
+          '<div style="font-family:monospace;font-size:11px;color:#64748b;word-break:break-all">' + escAttr(rule.expression) + '</div></div>' +
+          '<div style="display:flex;gap:6px;align-items:center"><label class="switch" style="margin:0"><input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleCacheRule(' + i + ', this.checked)"><span class="slider"></span></label>' +
+          '<button class="btn small" onclick="removeCacheRule(' + i + ')">删除</button></div></div></div>';
+      }).join('');
+    }
+    function openCacheRuleModal(){
+      ctx4.cacheEdit = null;
+      el('cacheRuleModalTitle').textContent = '新建缓存规则';
+      el('crExpr').value = ''; el('crCache').checked = true; el('crTtlMode').value = ''; el('crTtlSec').value = ''; el('crDesc').value = '';
+      el('cacheRuleModal').style.display = 'flex';
+    }
+    async function saveCacheRule(){
+      const zoneId = el('optZoneSel').value;
+      const expression = el('crExpr').value.trim();
+      if (!zoneId || !expression) return showNotification('请填写表达式', 'error');
+      const ap = { cache: el('crCache').checked };
+      const mode = el('crTtlMode').value; const sec = parseInt(el('crTtlSec').value, 10);
+      if (mode) { ap.edge_ttl = { mode: mode }; if ((mode === 'override_origin' || mode === 'set_ttl') && sec > 0) ap.edge_ttl.ttl = sec; }
+      const rule = { expression: expression, description: el('crDesc').value.trim() || undefined, action: 'set_cache_settings', action_parameters: ap, enabled: true };
+      const rules = ctx4.cacheRules.slice(); rules.push(rule);
+      const r = await api('save-cache-rules', { zoneId, rules });
+      if (!r || !r.success) return showNotification((r && r.error) || '保存失败', 'error');
+      closeModal('cacheRuleModal'); showNotification('缓存规则已保存'); loadCacheRules();
+    }
+    async function toggleCacheRule(i, on){
+      const zoneId = el('optZoneSel').value;
+      const rules = ctx4.cacheRules.map((x, j) => j === i ? Object.assign({}, x, { enabled: on }) : x);
+      const r = await api('save-cache-rules', { zoneId, rules });
+      if (!r || !r.success) { showNotification((r && r.error) || '操作失败', 'error'); loadCacheRules(); return; }
+      loadCacheRules();
+    }
+    function removeCacheRule(i){
+      const zoneId = el('optZoneSel').value;
+      const rules = ctx4.cacheRules.filter((x, j) => j !== i);
+      confirmDialog('删除该缓存规则？', async () => {
+        const r = await api('save-cache-rules', { zoneId, rules });
+        if (!r || !r.success) return showNotification((r && r.error) || '删除失败', 'error');
+        showNotification('已删除'); loadCacheRules();
+      });
+    }
+    async function loadZoneAnalytics(){
+      const box = el('zoneAnalyticsBox'); const zoneId = el('optZoneSel').value;
+      if (!zoneId) { box.innerHTML = ''; return; }
+      box.innerHTML = '<span style="color:#94a3b8">查询中…</span>';
+      const r = await api('get-zone-analytics', { zoneId });
+      if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '查询失败') + '</span>'; return; }
+      const groups = r.groups || [];
+      if (!groups.length) { box.innerHTML = '<span style="color:#94a3b8">近 24h 无请求数据</span>'; return; }
+      const pts = groups.map(g => ({ t: String(g.dimensions && g.dimensions.datetimeHour || '').slice(11, 16), req: (g.sum && g.sum.requests) || 0, bytes: (g.sum && g.sum.bytes) || 0 }));
+      const max = Math.max.apply(null, pts.map(p => p.req)) || 1;
+      const total = pts.reduce((a, b) => a + b.req, 0);
+      const bytes = pts.reduce((a, b) => a + b.bytes, 0);
+      box.innerHTML = '<div style="margin-bottom:6px">24h 请求 ' + total + ' · 流量 ' + fmtBytes(bytes) + '</div>' +
+        '<div style="display:flex;align-items:flex-end;gap:2px;height:90px">' + pts.map(p =>
+          '<div style="flex:1;min-width:0;background:#93c5fd;border-radius:2px 2px 0 0;height:' + Math.max(2, Math.round((p.req / max) * 88)) + 'px" title="' + escAttr(p.t + ' ' + p.req + ' req') + '"></div>').join('') + '</div>' +
+        '<div style="display:flex;justify-content:space-between;color:#94a3b8;font-size:11px;margin-top:2px"><span>' + pts[0].t + '</span><span>' + pts[pts.length - 1].t + '</span></div>';
+    }
+    function fmtBytes(b){
+      if (!b) return '0 B'; const u = ['B','KB','MB','GB','TB']; let i = 0; let v = b;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+      return v.toFixed(1) + ' ' + u[i];
+    }
+    // ---- 邮箱转发 ----
+    async function loadEmailPage(){ await fillZoneSel('emailZoneSel', 'email_zone'); loadEmailData(); }
+    async function loadEmailData(){
+      const zoneId = el('emailZoneSel').value;
+      if (!zoneId) return;
+      const r = await api('get-email-routing', { zoneId });
+      if (!r || !r.success) { el('emailRuleList').innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</span>'; return; }
+      ctx4.email = r.email || { enabled:false, rules:[], addresses:[] };
+      const e = ctx4.email;
+      const tg = el('emailRoutingToggle'); if (tg) tg.checked = !!e.enabled;
+      const hint = el('emailHintBox');
+      if (hint) hint.innerHTML = e.enabled
+        ? '<span style="color:#0f6e56">已启用</span>。若域名 MX 记录尚未指向 Cloudflare，请先在 DNS 添加：MX mail 0（目标 mail.<zone> 或 cf 指引）与 TXT v=spf1 include:_spf.mx.cloudflare.net ~all。'
+        : '未启用。启用后需在 DNS 添加 MX/TXT 记录（面板添加的域名若为 Cloudflare 代理可直接开）。';
+      const rl = el('emailRuleList');
+      if (!e.rules.length) rl.innerHTML = '<span style="color:#94a3b8">暂无规则 —— 点「新建规则」</span>';
+      else rl.innerHTML = e.rules.map((rule, i) => {
+        const on = rule.enabled !== false;
+        const m0 = (rule.matchers && rule.matchers[0]) || {};
+        const src = m0.type === 'all' ? '*@域名（Catch-all）' : (m0.value || '');
+        const a0 = (rule.actions && rule.actions[0]) || {};
+        const dst = a0.type === 'forward' ? ('转发 → ' + ((a0.value || []).join(', '))) : '丢弃';
+        return '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">' +
+          '<div style="flex:1;min-width:200px"><b>' + escAttr(src) + '</b> <span style="color:#475569">' + escAttr(dst) + '</span> ' + (on ? '<span style="color:#0f6e56;font-size:12px">启用</span>' : '<span style="color:#94a3b8;font-size:12px">停用</span>') + '</div>' +
+          '<div style="display:flex;gap:6px;align-items:center"><label class="switch" style="margin:0"><input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleEmailRule(' + i + ', this.checked)"><span class="slider"></span></label>' +
+          '<button class="btn small" style="background:#fee2e2;color:#b91c1c" onclick="removeEmailRule(' + i + ')">删除</button></div></div></div>';
+      }).join('');
+      const al = el('emailAddrList');
+      if (!e.addresses.length) al.innerHTML = '<span style="color:#94a3b8">无目标地址（需先在 dash → Email → Destination addresses 验证收件邮箱）</span>';
+      else al.innerHTML = e.addresses.map(a => '<div style="padding:3px 0">' + escAttr(a.email) + ' ' + (a.verified ? '<span style="color:#0f6e56">已验证</span>' : '<span style="color:#b45309">未验证</span>') + '</div>').join('');
+    }
+    async function setEmailRouting(on){
+      const zoneId = el('emailZoneSel').value;
+      const r = await api('set-email-routing', { zoneId, enabled: on });
+      if (!r || !r.success) { showNotification((r && r.error) || '切换失败', 'error'); loadEmailData(); return; }
+      showNotification(on ? '已启用接收' : '已停用'); loadEmailData();
+    }
+    function openEmailRuleModal(){
+      el('emailRuleModalTitle').textContent = '新建转发规则';
+      el('erMatchType').value = 'literal'; el('erAddress').value = ''; el('erAction').value = 'forward'; el('erTargets').value = '';
+      el('emailRuleModal').style.display = 'flex';
+    }
+    async function saveEmailRule(){
+      const zoneId = el('emailZoneSel').value;
+      if (!zoneId) return showNotification('请先选择域名', 'error');
+      const kind = el('erMatchType').value;
+      const addr = el('erAddress').value.trim();
+      const act = el('erAction').value;
+      const targets = el('erTargets').value.split(',').map(s => s.trim()).filter(Boolean);
+      const matchers = kind === 'all' ? [{ field: 'to', type: 'all' }] : [{ field: 'to', type: 'literal', value: addr }];
+      if (kind !== 'all' && !addr) return showNotification('请填写收件地址', 'error');
+      const actions = act === 'drop' ? [{ type: 'drop' }] : [{ type: 'forward', value: targets }];
+      if (act === 'forward' && !targets.length) return showNotification('请填写转发目标邮箱', 'error');
+      const rule = { matchers, actions, enabled: true, name: 'mycf-rule-' + Date.now() };
+      const r = await api('add-email-rule', { zoneId, rule });
+      if (!r || !r.success) return showNotification((r && r.error) || '保存失败', 'error');
+      closeModal('emailRuleModal'); showNotification('规则已添加'); loadEmailData();
+    }
+    async function toggleEmailRule(i, on){
+      const zoneId = el('emailZoneSel').value; const e = ctx4.email;
+      if (!e || !e.rules[i]) return;
+      const rule = Object.assign({}, e.rules[i], { enabled: on });
+      const r = await api('update-email-rule', { zoneId, ruleId: e.rules[i].id, rule });
+      if (!r || !r.success) { showNotification((r && r.error) || '操作失败', 'error'); loadEmailData(); return; }
+      loadEmailData();
+    }
+    function removeEmailRule(i){
+      const zoneId = el('emailZoneSel').value; const e = ctx4.email;
+      if (!e || !e.rules[i]) return;
+      confirmDialog('删除该转发规则？', async () => {
+        const r = await api('delete-email-rule', { zoneId, ruleId: e.rules[i].id });
+        if (!r || !r.success) return showNotification((r && r.error) || '删除失败', 'error');
+        showNotification('已删除'); loadEmailData();
+      });
+    }
+    // ---- DNS 导入导出 ----
+    async function openDnsExportImport(){
+      const sel = el('dnsIoZoneSel');
+      try {
+        const r = await api('list-zones', {});
+        if (r && r.success && Array.isArray(r.result)) sel.innerHTML = r.result.map(z => '<option value="' + escAttr(z.id) + '">' + escAttr(z.name) + '</option>').join('');
+      } catch(e){}
+      el('dnsIoOut').value = ''; el('dnsIoIn').value = ''; el('dnsIoResult').textContent = '';
+      el('dnsIOModal').style.display = 'flex';
+    }
+    async function exportDnsNow(){
+      const zoneId = el('dnsIoZoneSel').value;
+      if (!zoneId) return showNotification('请选择域名', 'error');
+      const r = await api('export-dns', { zoneId });
+      if (!r || !r.success) return showNotification((r && r.error) || '导出失败', 'error');
+      el('dnsIoOut').value = r.text || '';
+      ctx4.dnsZone = zoneId;
+      showNotification('已导出，可点「下载 .txt」');
+    }
+    function downloadExportedDns(){
+      const txt = el('dnsIoOut').value;
+      if (!txt) return showNotification('请先导出', 'error');
+      const name = (ctx4.dnsZone || 'zone') + '-dns.txt';
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
+      a.download = name; a.click();
+    }
+    async function importDnsNow(){
+      const zoneId = el('dnsIoZoneSel').value;
+      const text = el('dnsIoIn').value;
+      if (!zoneId) return showNotification('请选择域名', 'error');
+      if (!text.trim()) return showNotification('请粘贴 BIND 文本', 'error');
+      const r = await api('import-dns', { zoneId, bindText: text, proxied: el('dnsIoProxied').checked });
+      const box = el('dnsIoResult');
+      if (!r || !r.success) { box.textContent = (r && r.error) || '导入失败'; box.style.color = '#b91c1c'; return; }
+      const res = r.result || {};
+      const msg = '解析 ' + (res.total_parsed != null ? res.total_parsed : '?') + '，新增 ' + (res.recs_added != null ? res.recs_added : (res.total_imported != null ? res.total_imported : '?')) + ' 条' + (res.recs_skipped ? '，跳过 ' + res.recs_skipped : '');
+      box.textContent = msg; box.style.color = '#0f6e56';
+    }
+    // ---- R2 ----
+    async function loadR2Page(){
+      const box = el('r2BucketList');
+      box.innerHTML = '<span style="color:#94a3b8">加载中…</span>';
+      const r = await api('list-r2-buckets', {});
+      if (!r || !r.success) { box.innerHTML = '<span style="color:#b91c1c">' + escAttr((r && r.error) || '加载失败') + '</span>'; return; }
+      const buckets = r.buckets || [];
+      if (!buckets.length) { box.innerHTML = '<span style="color:#94a3b8">该账号暂无 R2 桶</span>'; return; }
+      box.innerHTML = buckets.map(b =>
+        '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:6px"><b>' + escAttr(b.name) + '</b>' +
+        '<span style="color:#94a3b8;font-size:12px">创建于 ' + escAttr(String(b.creation_date || b.created_on || '').slice(0, 10)) + '</span></div>').join('');
+    }
+    window.setZoneSetting = setZoneSetting; window.zoneHarden = zoneHarden;
+    window.openCacheRuleModal = openCacheRuleModal; window.saveCacheRule = saveCacheRule; window.toggleCacheRule = toggleCacheRule; window.removeCacheRule = removeCacheRule;
+    window.setEmailRouting = setEmailRouting; window.openEmailRuleModal = openEmailRuleModal; window.saveEmailRule = saveEmailRule; window.toggleEmailRule = toggleEmailRule; window.removeEmailRule = removeEmailRule;
+    window.openDnsExportImport = openDnsExportImport; window.exportDnsNow = exportDnsNow; window.downloadExportedDns = downloadExportedDns; window.importDnsNow = importDnsNow;
 
     // ===== OAuth 免密钥接入（设置页）=====
     async function loadOAuthUI(){
