@@ -1697,7 +1697,7 @@ async function queryUsageByAccountId(email, key, accountId){
   return { total: pages+workers, workers, pages, percent: Math.min(100, ((pages+workers)/100000)*100), byScript, error:false };
 }
 async function queryAllUsageForCred(env, cred){
-  const ar = await cfGet('/accounts', cred.email, cred.key);
+  const ar = await cfGet('/accounts', cred.email, (cred.oauth ? OAUTH_KEY_PREFIX + cred.accessToken : cred.key));
   if(!ar || !ar.success || !Array.isArray(ar.result)) return [{ email:cred.email, error:'无法获取账号列表' }];
   const out = [];
   for(const a of ar.result){
@@ -1907,12 +1907,12 @@ async function snapshotAssets(env){
   const snap = { ts: Date.now(), accounts: {} };
   for(const c of creds){
     try {
-      const ar = await cfGet('/accounts', c.email, c.key);
+      const ar = await cfGet('/accounts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
       if(!ar.success){ snap.accounts[c.email] = { error:'凭据失效/403', alive:false }; continue; }
       const entry = { alive:true, accounts: [] };
       for(const a of (ar.result||[])){
-        let workers=[]; try { const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, c.key); workers = (wr.success&&wr.result)?wr.result.map(w=>w.id):[]; } catch(e){}
-        let zones=[]; try { const zr = await cfGet('/zones?account.id='+a.id, c.email, c.key); zones = (zr.success&&zr.result)?zr.result.map(z=>({id:z.id,name:z.name,status:z.status})):[]; } catch(e){}
+        let workers=[]; try { const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); workers = (wr.success&&wr.result)?wr.result.map(w=>w.id):[]; } catch(e){}
+        let zones=[]; try { const zr = await cfGet('/zones?account.id='+a.id, c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); zones = (zr.success&&zr.result)?zr.result.map(z=>({id:z.id,name:z.name,status:z.status})):[]; } catch(e){}
         entry.accounts.push({ id:a.id, name:a.name, workers, zones });
       }
       snap.accounts[c.email] = entry;
@@ -1977,11 +1977,11 @@ async function queryStorageUsage(env){
   const creds = await loadKVAccounts(env); const out = [];
   for(const c of creds){
     try {
-      const ar = await cfGet('/accounts', c.email, c.key); if(!ar.success){ out.push({email:c.email, error:true}); continue; }
+      const ar = await cfGet('/accounts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); if(!ar.success){ out.push({email:c.email, error:true}); continue; }
       for(const a of (ar.result||[])){
-        let d1Count=0; try { const r = await cfGet('/accounts/'+a.id+'/d1/database', c.email, c.key); d1Count = (r.success&&r.result)?r.result.length:0; } catch(e){}
+        let d1Count=0; try { const r = await cfGet('/accounts/'+a.id+'/d1/database', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); d1Count = (r.success&&r.result)?r.result.length:0; } catch(e){}
         let r2Ops=0, kvOps=0;
-        try { const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, c.key)), body: JSON.stringify({ query: STORAGE_QUERY, variables:{ accountId:a.id } }) }); const res = await g.json(); const vr = res?.data?.viewer?.accounts?.[0]; r2Ops = vr?.r2AggregateAnalytics?.[0]?.sum?.requests||0; kvOps = vr?.kvOperationsAdaptive?.[0]?.sum?.requests||0; } catch(e){}
+        try { const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key))), body: JSON.stringify({ query: STORAGE_QUERY, variables:{ accountId:a.id } }) }); const res = await g.json(); const vr = res?.data?.viewer?.accounts?.[0]; r2Ops = vr?.r2AggregateAnalytics?.[0]?.sum?.requests||0; kvOps = vr?.kvOperationsAdaptive?.[0]?.sum?.requests||0; } catch(e){}
         out.push({ email:c.email, accountId:a.id, name:a.name, d1Count, r2Ops, kvOps });
       }
     } catch(e){ out.push({ email:c.email, error:String(e) }); }
@@ -1995,10 +1995,10 @@ async function probeEndpoints(env){
   const creds = await loadKVAccounts(env); const results = [];
   for(const c of creds){
     try {
-      const ar = await cfGet('/accounts', c.email, c.key); if(!ar.success) continue;
+      const ar = await cfGet('/accounts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); if(!ar.success) continue;
       for(const a of (ar.result||[])){
         try {
-          const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, c.key);
+          const wr = await cfGet('/accounts/'+a.id+'/workers/scripts', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
           const workers = (wr.success&&wr.result)?wr.result:[];
           for(const w of workers.slice(0,3)){
             const sd = (w.defaultDomain&&w.defaultDomain.hostname) || (w.domains&&w.domains[0]&&w.domains[0].hostname);
@@ -2026,10 +2026,10 @@ async function checkCertExpiry(env){
   const creds = await loadKVAccounts(env); const out = [];
   for(const c of creds){
     try {
-      const zr = await cfGet('/zones', c.email, c.key); if(!zr.success) continue;
+      const zr = await cfGet('/zones', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key)); if(!zr.success) continue;
       for(const z of (zr.result||[])){
         try {
-          const cr = await cfGet('/zones/'+z.id+'/ssl/certificate_packs', c.email, c.key);
+          const cr = await cfGet('/zones/'+z.id+'/ssl/certificate_packs', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
           const packs = (cr.success&&cr.result)?cr.result:[];
           let minDays=null;
           for(const p of packs){ for(const crt of (p.certificates||[])){ if(crt.expires_on){ const d = Math.ceil((new Date(crt.expires_on)-Date.now())/86400000); if(minDays===null||d<minDays) minDays=d; } } }
@@ -2051,12 +2051,12 @@ async function checkWaf(env){
   const creds = await loadKVAccounts(env); const out = [];
   for(const c of creds){
     try {
-      const zr = await cfGet('/zones', c.email, c.key);
+      const zr = await cfGet('/zones', c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key));
       for(const z of (zr.result||[])){
         try {
           const end = new Date().toISOString(); const start = new Date(Date.now()-86400000).toISOString();
           const q = `query W($zone:String!,$f:ZoneFirewallEventsFilter_InputObject){viewer{zones(filter:{zoneTag:$zone}){firewallEventsAdaptiveGroups(limit:1,filter:$f){sum{requests}}}}}`;
-          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, c.key)), body: JSON.stringify({ query:q, variables:{ zone:z.id, f:{ datetime_geq:start, datetime_leq:end } } }) });
+          const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers:Object.assign({ 'Content-Type':'application/json' }, cfHeaders(c.email, (c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key))), body: JSON.stringify({ query:q, variables:{ zone:z.id, f:{ datetime_geq:start, datetime_leq:end } } }) });
           const res = await g.json(); const cnt = res?.data?.viewer?.zones?.[0]?.firewallEventsAdaptiveGroups?.[0]?.sum?.requests || 0;
           out.push({ email:c.email, zone:z.name, blocked:cnt });
         } catch(e){}
@@ -2105,8 +2105,12 @@ async function updateAccountStatuses(env){
   const newly = [];
   for(const a of accounts){
     let status='ok', reason='';
+    // OAuth 会话过期时先静默刷新，避免把临时失效误标为封号
+    if(a && a.oauth && a.refreshToken && (!a.expiresAt || Date.now() > a.expiresAt - 60000)){
+      try { await refreshOAuthToken(env, a); } catch(e){}
+    }
     try {
-      const ar = await cfAny('GET','/accounts', a.email, a.key);
+      const ar = await cfAny('GET','/accounts', a.email, (a.oauth ? OAUTH_KEY_PREFIX + a.accessToken : a.key));
       if(!ar || !ar.success){
         const code = ar ? ar.status : 0;
         if(code===401 || code===403 || (ar && ar.errors && ar.errors[0] && ar.errors[0].code===10000)){
@@ -5842,7 +5846,7 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
 
     window.navTo = navTo;
     window.logout = function() {
-      localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key');
+      localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); localStorage.removeItem('cf_active_oauth');
       // 同时清掉密码会话，否则 /login 会因会话有效自动跳回面板
       fetch('/logout').catch(()=>{}).finally(() => { location.href = '/login'; });
     };
