@@ -1220,9 +1220,10 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
 
       // ================= 监控中心 actions（走 KV 凭据，免登录校验） =================
       case 'get-dashboard': {
-        const out = { snap: null, daily: {}, usage: {}, accounts: [] };
+        const out = { snap: null, daily: {}, usage: {}, accounts: [], officialDaily: {}, officialFetchedAt: '' };
         try { const r = await kvGet(env, 'an_snap'); if (r) out.snap = JSON.parse(r); } catch(e){}
         try { const r = await kvGet(env, 'an_daily'); if (r) out.daily = JSON.parse(r) || {}; } catch(e){}
+        try { const r = await kvGet(env, 'official_daily'); if (r) { const od = JSON.parse(r) || {}; out.officialDaily = od.data || {}; out.officialFetchedAt = od.fetchedAt || ''; } } catch(e){}
         try { const r = await kvGet(env, 'usage_history'); if (r) out.usage = JSON.parse(r) || {}; } catch(e){}
         try {
           const accs = await loadKVAccounts(env);
@@ -1232,8 +1233,9 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       }
       case 'collect-analytics-now': {
         if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
-        const r = await storeAnalytics(env);
-        return json({ success: true, ok: r.ok, fail: r.fail });
+        const h = await storeAnalytics(env);        // 24h 快照（官方 1hGroups 直读）
+        const d = await storeOfficialAnalytics(env); // 官方按日 92 天直读
+        return json({ success: true, ok: h.ok + d.ok, fail: h.fail + d.fail });
       }
 
       case 'get-usage-trend': {
@@ -2080,6 +2082,51 @@ async function storeAnalytics(env){
   return { ok, fail };
 }
 
+// 官方按日直读：httpRequests1dGroups 免费计划可查 365 天，每账号一次 GraphQL 拉全部 zones
+// 按日期聚合为账号级日数据，合并写入 KV official_daily（{ fetchedAt, data:{ date:{ email:{req,bytes,uniq,pageViews} } } }）
+async function storeOfficialAnalytics(env, days = 92){
+  const creds = await loadKVAccounts(env);
+  if(!creds.length) return { ok:0, fail:0 };
+  const now = new Date();
+  const le = now.toISOString().slice(0,10);
+  const ge = new Date(now.getTime() - (days - 1) * 86400000).toISOString().slice(0,10);
+  let merged = null; let ok = 0, fail = 0;
+  for(const c of creds){
+    try {
+      const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
+      const key = c.oauth ? OAUTH_KEY_PREFIX + c.accessToken : c.key;
+      if(!key){ fail++; continue; }
+      const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
+      if(!accountId){ fail++; continue; }
+      const q = 'query($tag:String!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:"' + ge + '",date_leq:"' + le + '"}){dimensions{date}sum{requests bytes pageViews}uniq{uniques}}}}}}';
+      const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId } }) });
+      const res = await g.json();
+      const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
+      const zones = (acc && acc.zones) || [];
+      const dayMap = {};
+      for(const z of zones){
+        for(const d of (z.httpRequests1dGroups || [])){
+          const dt = d.dimensions && d.dimensions.date; if(!dt) continue;
+          const s = d.sum || {}, u = d.uniq || {};
+          const rec = dayMap[dt] = dayMap[dt] || { req:0, bytes:0, uniq:0, pageViews:0 };
+          rec.req += (s.requests || 0); rec.bytes += (s.bytes || 0); rec.pageViews += (s.pageViews || 0); rec.uniq += (u.uniques || 0);
+        }
+      }
+      if(!merged){
+        try { const r0 = await kvGet(env, 'official_daily'); if(r0) merged = JSON.parse(r0) || null; } catch(e){ merged = null; }
+        if(!merged) merged = { data:{} };
+      }
+      for(const dt of Object.keys(dayMap)){
+        const dayRec = merged.data[dt] = merged.data[dt] || {};
+        dayRec[email] = Object.assign({ email }, dayMap[dt]);
+      }
+      ok++;
+    } catch(e){ fail++; }
+  }
+  if(ok && merged){ merged.fetchedAt = new Date().toISOString(); await kvPut(env, 'official_daily', merged); }
+  return { ok, fail };
+}
+
 function computeUsageTrend(history, days){
   const dates = Object.keys(history||{}).sort().slice(-days);
   return dates.map(d => ({ date:d, total:(history[d]||[]).reduce((t,r)=>t+(r.total||0),0) }));
@@ -2361,6 +2408,7 @@ async function runDailyMonitoring(env){
   const cfg = await getTGConfig(env);
   await storeDailySnapshots(env);
   await storeAnalytics(env).catch(()=>{});
+  await storeOfficialAnalytics(env).catch(()=>{});
   await storeStorageUsage(env);
   const cur = await snapshotAssets(env);
   let prev = null; try { const r = await kvGet(env,'asset_snapshot'); if(r) prev = JSON.parse(r); } catch(e){}
@@ -2839,8 +2887,7 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <div class="metric"><div class="small">最近采集</div><div style="font-size:15px;font-weight:700" id="dashTs">-</div></div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
-        <div class="card" style="margin-top:0">
-          <div style="font-weight:700;margin-bottom:4px">24h 请求走势</div>
+        <div class="card" style="margin-top:0"><div style="font-weight:700">24h 请求走势 <span style="font-weight:400;font-size:11px;color:#94a3b8">(官方小时直读 · 采集中)</span></div>
           <div id="dashTrend" class="small" style="font-family:monospace">-</div>
         </div>
         <div class="card" style="margin-top:0">
@@ -2849,7 +2896,11 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         </div>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
-        <div class="card" style="margin-top:0"><div style="font-weight:700">近 14 天请求 <span style="font-weight:400;font-size:11px;color:#94a3b8">(免费版自积累)</span></div><div id="dashDaily" class="small" style="font-family:monospace;margin-top:6px">-</div></div>
+        <div class="card" style="margin-top:0"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-weight:700">请求趋势</span>
+          <select id="dashTrendDays" class="input" style="width:auto" onchange="trendDaysChanged()"><option value="7">近 7 天</option><option value="14" selected>近 14 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option></select>
+          <span id="dashDailySrc" style="font-weight:400;font-size:11px;color:#94a3b8"></span></div>
+          <div id="dashDaily" class="small" style="font-family:monospace;margin-top:6px">-</div>
+        </div>
         <div class="card" style="margin-top:0"><div style="font-weight:700">配额消耗 14 天</div><div id="dashQuotaChart" class="small" style="font-family:monospace;margin-top:6px">-</div></div>
       </div>
       <div class="card" style="margin-top:12px">
@@ -4257,6 +4308,15 @@ function renderStaticJS(env) {
       if (v) localStorage.setItem('dash_scope', v); else localStorage.removeItem('dash_scope');
       renderDash();
     }
+    function trendDays(){
+      const s = el('dashTrendDays'); if (!s) return 14;
+      if (!s.dataset.done) { s.dataset.done = '1'; const saved = localStorage.getItem('dash_trend_days'); if (saved && ['7','14','30','90'].indexOf(saved) !== -1) s.value = saved; else s.value = '14'; }
+      return parseInt(s.value, 10) || 14;
+    }
+    function trendDaysChanged(){
+      const s = el('dashTrendDays'); if (s) localStorage.setItem('dash_trend_days', s.value);
+      renderDash();
+    }
     function dashFollowKey(acc){ return (acc && (acc.email || acc.name || acc.oauthId)) || ''; }
     function dashApplyScope(key){
       const sel = el('dashScope');
@@ -4378,15 +4438,20 @@ function renderStaticJS(env) {
           '<div style="flex:0 0 auto;font-size:11px;color:#64748b">' + fmtNum(a.req) + '</div></div>').join('')
           : '<span style="color:#94a3b8">暂无账号请求数据</span>';
       }
-      // 近 14 天请求（自积累）
-      const dk = Object.keys(d.daily || {}).sort().slice(-14);
+      // 请求趋势：官方直读(httpRequests1dGroups,免费 365 天)优先，自采 an_daily 兜底
+      const daysN = trendDays();
+      const od = (d.officialDaily && Object.keys(d.officialDaily).length) ? d.officialDaily : null;
+      const srcD = od || d.daily || {};
+      const srcLabel = od ? '官方直读 · 365天可查' : '自采(每日累积)';
+      const srcHint = el('dashDailySrc'); if (srcHint) srcHint.textContent = srcLabel + (od && d.officialFetchedAt ? ' · 更新 ' + new Date(d.officialFetchedAt).toLocaleDateString('zh-CN') : '');
+      const dk = Object.keys(srcD).sort().slice(-daysN);
       const dpts = dk.map(dd => {
-        const rows = Object.keys(d.daily[dd] || {}).map(k => d.daily[dd][k]);
+        const rows = Object.keys(srcD[dd] || {}).map(k => srcD[dd][k]);
         const selV = el('dashScope').value;
         const sum = rows.filter(r => !selV || r.email === selV).reduce((s, r) => s + (r.req || 0), 0);
         return { l: dd.slice(5), v: sum };
       });
-      el('dashDaily').innerHTML = dpts.length ? barHtml(dpts) : '<span style="color:#94a3b8">暂无历史（需每日采集累积）</span>';
+      el('dashDaily').innerHTML = dpts.length ? barHtml(dpts) : '<span style="color:#94a3b8">暂无数据（官方：点「立即采集」；自采需每日累积）</span>';
       // 配额 14 天
       const uk = Object.keys(d.usage || {}).sort().slice(-14);
       const qpts = uk.map(dd => {
@@ -4431,7 +4496,7 @@ function renderStaticJS(env) {
       dashApplyScope(emailKey);
       showNotification('已设为执行账号：' + emailKey + '（总览已切到该账号）');
     }
-    window.renderDash = renderDash; window.dashScopeChanged = dashScopeChanged; window.collectAnalyticsNow = collectAnalyticsNow; window.openDashZones = openDashZones; window.dashSetActive = dashSetActive;
+    window.renderDash = renderDash; window.dashScopeChanged = dashScopeChanged; window.trendDaysChanged = trendDaysChanged; window.collectAnalyticsNow = collectAnalyticsNow; window.openDashZones = openDashZones; window.dashSetActive = dashSetActive;
     async function renderAccounts(){
       const arr = await kvMergeAccounts();
       const box = el('accountsBox'); if (!box) return;
