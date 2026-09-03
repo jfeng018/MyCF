@@ -2134,6 +2134,23 @@ async function storeAnalytics(env){
       zonesAgg.sort((a, b) => b.req - a.req);
       const points = Object.keys(hourMap).sort().map(h => ({ t: h + ':00', req: hourMap[h] }));
       out[email] = { email, accountId, name: c.name || '', zones: zonesAgg, req, bytes, uniq, points };
+      // 24h 分布（国家/状态码/数据中心）：官方 adaptive 一次别名查询；失败仅跳过分布，不影响快照
+      try {
+        const q2 = 'query($tag:String!,$st:Time!,$et:Time!){viewer{accounts(filter:{accountTag:$tag}){zones{country:httpRequestsAdaptiveGroups(limit:80,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{clientCountryName}}status:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{edgeResponseStatus}}colo:httpRequestsAdaptiveGroups(limit:60,filter:{datetime_geq:$st,datetime_leq:$et,requestSource:"eyeball"}){count dimensions{coloCode}}}}}}';
+        const g2 = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q2, variables:{ tag:accountId, st, et } }) });
+        const j2 = await g2.json();
+        const zs2 = j2 && j2.data && j2.data.viewer && j2.data.viewer.accounts && j2.data.viewer.accounts[0] && j2.data.viewer.accounts[0].zones;
+        if (zs2 && Array.isArray(zs2)) {
+          const cmap = {}, smap = {}, lmap = {};
+          for(const z of zs2){
+            for(const g of (z.country || [])){ const n = g.dimensions && g.dimensions.clientCountryName; if(n) cmap[n] = (cmap[n] || 0) + (g.count || 0); }
+            for(const g of (z.status || [])){ const n = g.dimensions && g.dimensions.edgeResponseStatus; if(n != null) { const k = String(n); smap[k] = (smap[k] || 0) + (g.count || 0); } }
+            for(const g of (z.colo || [])){ const n = g.dimensions && g.dimensions.coloCode; if(n) lmap[n] = (lmap[n] || 0) + (g.count || 0); }
+          }
+          const top = (m, lim) => Object.keys(m).map(k => ({ name:k, req:m[k] })).sort((a, b) => b.req - a.req).slice(0, lim);
+          out[email].countries = top(cmap, 8); out[email].statuses = top(smap, 8); out[email].colos = top(lmap, 8);
+        }
+      } catch(e){}
       ok++;
     } catch(e){ fail++; }
   }
@@ -2163,7 +2180,7 @@ async function storeOfficialAnalytics(env, days = 92){
       if(!key){ fail++; continue; }
       const accountId = c.accountId || await getAccountId(email, key).catch(()=>null);
       if(!accountId){ fail++; continue; }
-      const q = 'query($tag:String!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:"' + ge + '",date_leq:"' + le + '"}){dimensions{date}sum{requests bytes pageViews cachedRequests threats}uniq{uniques}}}}}}';
+      const q = 'query($tag:String!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:"' + ge + '",date_leq:"' + le + '"}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}}';
       const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId } }) });
       const res = await g.json();
       const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
@@ -2173,9 +2190,9 @@ async function storeOfficialAnalytics(env, days = 92){
         for(const d of (z.httpRequests1dGroups || [])){
           const dt = d.dimensions && d.dimensions.date; if(!dt) continue;
           const s = d.sum || {}, u = d.uniq || {};
-          const rec = dayMap[dt] = dayMap[dt] || { req:0, bytes:0, uniq:0, pageViews:0, cachedRequests:0, threats:0 };
+          const rec = dayMap[dt] = dayMap[dt] || { req:0, bytes:0, uniq:0, pageViews:0, cachedRequests:0, cachedBytes:0, threats:0 };
           rec.req += (s.requests || 0); rec.bytes += (s.bytes || 0); rec.pageViews += (s.pageViews || 0); rec.uniq += (u.uniques || 0);
-          rec.cachedRequests += (s.cachedRequests || 0); rec.threats += (s.threats || 0);
+          rec.cachedRequests += (s.cachedRequests || 0); rec.cachedBytes += (s.cachedBytes || 0); rec.threats += (s.threats || 0);
         }
       }
       if(!merged){
@@ -2995,6 +3012,7 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <div class="metric"><div class="small">24h 带宽</div><div style="font-size:26px;font-weight:700" id="dashBytes">-</div></div>
         <div class="metric"><div class="small">24h 访问者</div><div style="font-size:26px;font-weight:700" id="dashUniq">-</div></div>
         <div class="metric"><div class="small">缓存命中率(官方日)</div><div style="font-size:26px;font-weight:700;color:#0f6e56" id="dashCache">-</div></div>
+        <div class="metric"><div class="small">缓存流量(官方日)</div><div style="font-size:26px;font-weight:700;color:#0f6e56" id="dashCachedBytes">-</div></div>
         <div class="metric"><div class="small">威胁拦截(官方日)</div><div style="font-size:26px;font-weight:700;color:#b45309" id="dashThreats">-</div></div>
         <div class="metric"><div class="small">今日配额 (100k)</div><div style="font-size:26px;font-weight:700;color:#d97706" id="dashQuota">-</div></div>
         <div class="metric"><div class="small">异常 / 封号</div><div style="font-size:26px;font-weight:700;color:#a32d2d" id="dashBad">-</div></div>
@@ -3016,6 +3034,10 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
           <div id="dashDaily" class="small" style="font-family:monospace;margin-top:6px">-</div>
         </div>
         <div class="card" style="margin-top:0"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-weight:700">配额消耗 14 天</span><span style="font-weight:400;font-size:11px;color:#94a3b8" id="dashQuotaSrc">官方直读</span><button class="btn small" onclick="backfillUsageHistory()">回填官方历史(≤30 天)</button></div><div id="dashQuotaChart" class="small" style="font-family:monospace;margin-top:6px">-</div></div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <div style="font-weight:700;margin-bottom:4px">24h 请求分布 <span style="font-weight:400;font-size:11px;color:#94a3b8">(国家 / 状态码 / 数据中心 · 官方 adaptive)</span></div>
+        <div id="dashDist" class="small" style="font-family:monospace;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px"></div>
       </div>
       <div class="card" style="margin-top:12px">
         <h3 style="margin:0 0 8px">账号明细 <span class="small">点「Zones」下钻 · 点「设为执行」切换</span></h3>
@@ -4459,6 +4481,24 @@ function renderStaticJS(env) {
       const rec = (data || {})[v];
       return rec ? [rec] : [];
     }
+    function distBars(list, color){
+      if (!list || !list.length) return '<span style="color:#94a3b8">无数据</span>';
+      const max = Math.max.apply(null, list.map(x => x.v)) || 1;
+      return '<div style="margin-top:2px">' + list.map(x =>
+        '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="flex:0 0 38px;font-size:11px;color:#334155;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escAttr(x.l) + '</span>' +
+        '<div style="flex:1;height:10px;background:#f1f5f9;border-radius:5px"><div style="height:10px;width:' + Math.max(2, Math.round((x.v / max) * 100)) + '%;background:' + color + ';border-radius:5px"></div></div>' +
+        '<span style="flex:0 0 52px;font-size:11px;color:#64748b;text-align:right">' + fmtNum(x.v) + '</span></div>').join('') + '</div>';
+    }
+    function dashDistHtml(recs){
+      const c = {}, s = {}, co = {};
+      recs.forEach(r => { (r.countries || []).forEach(i => { c[i.name] = (c[i.name] || 0) + (i.req || 0); }); (r.statuses || []).forEach(i => { const k = i.name != null ? String(i.name) : i.code; s[k] = (s[k] || 0) + (i.req || 0); }); (r.colos || []).forEach(i => { co[i.name] = (co[i.name] || 0) + (i.req || 0); }); });
+      const t = (m) => Object.keys(m).map(k => ({ l:k, v:m[k] })).sort((a, b) => b.v - a.v).slice(0, 6);
+      const any = Object.keys(c).length || Object.keys(s).length || Object.keys(co).length;
+      if (!any) return '<span style="color:#94a3b8">暂无分布数据 —— 采集后自动生成（国家/状态码/数据中心）</span>';
+      return '<div><div style="font-size:12px;color:#475569;margin-bottom:2px">国家 Top6</div>' + distBars(t(c), '#3b82f6') + '</div>' +
+             '<div><div style="font-size:12px;color:#475569;margin-bottom:2px">状态码 Top6</div>' + distBars(t(s), '#8b5cf6') + '</div>' +
+             '<div><div style="font-size:12px;color:#475569;margin-bottom:2px">数据中心 Top6</div>' + distBars(t(co), '#0ea5e9') + '</div>';
+    }
     function barHtml(pts, w){
       const max = Math.max.apply(null, pts.map(p => p.v)) || 1;
       return '<div style="display:flex;align-items:flex-end;gap:3px;height:86px">' + pts.map(p =>
@@ -4517,11 +4557,12 @@ function renderStaticJS(env) {
       const d = dashCache;
       const t = (id, txt) => { const e = el(id); if (e) e.textContent = txt; };
       if (!d || !d.snap || !d.snap.data) {
-        t('dashReq', '-'); t('dashBytes', '-'); t('dashUniq', '-'); t('dashCache', '-'); t('dashThreats', '-'); t('dashQuota', '-'); t('dashBad', '-'); t('dashTs', '未采集');
+        t('dashReq', '-'); t('dashBytes', '-'); t('dashUniq', '-'); t('dashCache', '-'); t('dashCachedBytes', '-'); t('dashThreats', '-'); t('dashQuota', '-'); t('dashBad', '-'); t('dashTs', '未采集');
         el('dashTrend').innerHTML = '<span style="color:#94a3b8">暂无数据 —— 点击右上「立即采集」</span>';
         el('dashShare').innerHTML = ''; el('dashShareTitle').textContent = '各账号请求占比';
         el('dashDaily').innerHTML = '<span style="color:#94a3b8">-</span>';
         el('dashQuotaChart').innerHTML = '<span style="color:#94a3b8">-</span>';
+        const dE = el('dashDist'); if (dE) dE.innerHTML = '';
         el('dashTable').innerHTML = '';
         return;
       }
@@ -4540,10 +4581,13 @@ function renderStaticJS(env) {
         const rs2 = rows.filter(r => !selV2 || r.email === selV2);
         const oReq = rs2.reduce((s, r) => s + (r.req || 0), 0);
         const oCached = rs2.reduce((s, r) => s + (r.cachedRequests || 0), 0);
+        const oCachedB = rs2.reduce((s, r) => s + (r.cachedBytes || 0), 0);
         const oThreats = rs2.reduce((s, r) => s + (r.threats || 0), 0);
-        if (oReq > 0) { t('dashCache', Math.round((oCached / oReq) * 100) + '%'); t('dashThreats', fmtNum(oThreats)); }
-        else { t('dashCache', '-'); t('dashThreats', '-'); }
-      } else { t('dashCache', '-'); t('dashThreats', '-'); }
+        if (oReq > 0) { t('dashCache', Math.round((oCached / oReq) * 100) + '%'); t('dashCachedBytes', fmtBytes(oCachedB)); t('dashThreats', fmtNum(oThreats)); }
+        else { t('dashCache', '-'); t('dashCachedBytes', '-'); t('dashThreats', '-'); }
+      } else { t('dashCache', '-'); t('dashCachedBytes', '-'); t('dashThreats', '-'); }
+      // 24h 分布（国家/状态码/数据中心）
+      const dBox = el('dashDist'); if (dBox) dBox.innerHTML = dashDistHtml(recs);
       const bad = dashPick(d.accounts).filter(a => a.status && a.status !== 'ok').length;
       t('dashBad', String(bad));
       t('dashTs', new Date(d.snap.ts).toLocaleString('zh-CN', { hour12: false }));
