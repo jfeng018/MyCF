@@ -18,11 +18,16 @@ export default {
     try {
       const utcHour = new Date().getUTCHours();
       await heartbeat(env);
+      // 时段偏好：日报推送小时可配置（UTC，默认 23=北京 07:23）；探活 4h 一次避开该小时
+      let reportHours = [23];
+      try { const c = await getTGConfig(env); if (c && Array.isArray(c.reportHours) && c.reportHours.length) reportHours = c.reportHours; } catch(e){}
       if (utcHour === 23) {
         await runDailyMonitoring(env);
+      }
+      if (reportHours.indexOf(utcHour) !== -1) {
         await pushDailyReport(env);
       }
-      if (utcHour % 4 === 3 && utcHour !== 23) {
+      if (utcHour % 4 === 3 && reportHours.indexOf(utcHour) === -1) {
         await runProbeMonitoring(env);
       }
     } catch (e) {
@@ -1142,6 +1147,8 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
         if (typeof cfg.dailyReport === 'boolean') merged.dailyReport = cfg.dailyReport;
         if (typeof cfg.alerts === 'boolean') merged.alerts = cfg.alerts;
         if (typeof cfg.alertsTraffic === 'boolean') merged.alertsTraffic = cfg.alertsTraffic;
+        if (Array.isArray(cfg.reportHours)) merged.reportHours = cfg.reportHours.map(Number).filter(h => h >= 0 && h <= 23);
+        if (cfg.segments && typeof cfg.segments === 'object' && !Array.isArray(cfg.segments)) merged.segments = { quota: cfg.segments.quota !== false, traffic: cfg.segments.traffic !== false, health: cfg.segments.health !== false };
         await env.CF_ACCOUNTS_KV.put('tg_config', JSON.stringify(merged));
         return json({ success: true });
       }
@@ -1775,7 +1782,7 @@ function buildDailyReport(results, dateStr, ctx){
   L.push('🗓 ' + dateStr + ' (UTC)');
   const sd = ctx.snapData || {};
   const allRecs = Object.keys(sd).map(k => sd[k]);
-  if(allRecs.length){
+  if(allRecs.length && !(ctx.segments && ctx.segments.traffic === false)){
     const tReq = allRecs.reduce((s,r)=>s+(r.req||0),0);
     const tB = allRecs.reduce((s,r)=>s+(r.bytes||0),0);
     const tU = allRecs.reduce((s,r)=>s+(r.uniq||0),0);
@@ -1791,17 +1798,21 @@ function buildDailyReport(results, dateStr, ctx){
     const rank = ranks[idx] || ((idx+1) + '.');
     L.push('');
     L.push(rank + ' ' + masked + name);
-    L.push('   配额 ' + fmtNum(r.total) + ' / 100,000  (' + pct.toFixed(1) + '%)  ' + relBar(r.total, 100000, 12));
-    L.push('   Workers ' + fmtNum(r.workers) + ' · Pages ' + fmtNum(r.pages));
-    if(r.byScript && r.byScript.length){
-      const top = r.byScript.slice(0,5).map(s=> s.script + ' ' + fmtNum(s.requests)).join(' · ');
-      L.push('   Top: ' + top);
+    if(!(ctx.segments && ctx.segments.quota === false)){
+      L.push('   配额 ' + fmtNum(r.total) + ' / 100,000  (' + pct.toFixed(1) + '%)  ' + relBar(r.total, 100000, 12));
+      L.push('   Workers ' + fmtNum(r.workers) + ' · Pages ' + fmtNum(r.pages));
+      if(r.byScript && r.byScript.length){
+        const top = r.byScript.slice(0,5).map(s=> s.script + ' ' + fmtNum(s.requests)).join(' · ');
+        L.push('   Top: ' + top);
+      }
     }
-    const s = sd[r.email];
-    if(s){
-      L.push('   🚦 请求 ' + fmtNum(s.req) + ' · 流量 ' + fmtBytesB(s.bytes) + ' · 访问 ' + fmtNum(s.uniq));
-      const zt = (s.zones||[]).slice(0,3);
-      if(zt.length) L.push('   Zones: ' + zt.map(z => z.name + ' ' + fmtNum(z.req)).join(' · '));
+    if(!(ctx.segments && ctx.segments.traffic === false)){
+      const s = sd[r.email];
+      if(s){
+        L.push('   🚦 请求 ' + fmtNum(s.req) + ' · 流量 ' + fmtBytesB(s.bytes) + ' · 访问 ' + fmtNum(s.uniq));
+        const zt = (s.zones||[]).slice(0,3);
+        if(zt.length) L.push('   Zones: ' + zt.map(z => z.name + ' ' + fmtNum(z.req)).join(' · '));
+      }
     }
   });
   fail.forEach(r=>{
@@ -1810,16 +1821,18 @@ function buildDailyReport(results, dateStr, ctx){
     L.push('⚠ ' + masked + ' ' + (r.name||''));
     L.push('   查询失败: ' + (r.error||'未知错误'));
   });
-  const hs = [];
-  const abn = ctx.abnormal || [];
-  if(abn.length) hs.push('🚫 异常账号 ' + abn.length + '：' + abn.map(a => maskEmail(a.email)).join('、'));
-  const certDue = (ctx.certs || []).filter(c => c.days !== null && c.days <= 7).length;
-  if(certDue) hs.push('🛡 证书 ' + certDue + ' 张 7 天内到期');
-  const down = (ctx.probes || []).filter(p => !p.ok).length;
-  if(down) hs.push('📡 探活下线 ' + down + ' 个端点');
-  const wafN = (ctx.waf || []).filter(w => w.blocked >= 50000).length;
-  if(wafN) hs.push('🔥 WAF 拦截突增 ' + wafN + ' 个 zone');
-  if(hs.length){ L.push(''); L.push('───── 健康 ─────'); hs.forEach(h => L.push(h)); }
+  if(!(ctx.segments && ctx.segments.health === false)){
+    const hs = [];
+    const abn = ctx.abnormal || [];
+    if(abn.length) hs.push('🚫 异常账号 ' + abn.length + '：' + abn.map(a => maskEmail(a.email)).join('、'));
+    const certDue = (ctx.certs || []).filter(c => c.days !== null && c.days <= 7).length;
+    if(certDue) hs.push('🛡 证书 ' + certDue + ' 张 7 天内到期');
+    const down = (ctx.probes || []).filter(p => !p.ok).length;
+    if(down) hs.push('📡 探活下线 ' + down + ' 个端点');
+    const wafN = (ctx.waf || []).filter(w => w.blocked >= 50000).length;
+    if(wafN) hs.push('🔥 WAF 拦截突增 ' + wafN + ' 个 zone');
+    if(hs.length){ L.push(''); L.push('───── 健康 ─────'); hs.forEach(h => L.push(h)); }
+  }
   L.push('');
   L.push('────────────────────────');
   L.push('由 MyCF 自动推送 · 配额 UTC 重置 · 流量为最近 24h 采集快照');
@@ -1962,7 +1975,7 @@ async function pushDailyReport(env, force = false){
   }
   const dateStr = new Date().toISOString().slice(0,10);
   // 收集健康/流量上下文（读 KV，不外发请求）
-  const ctx = { snapData: {}, abnormal: [], certs: [], probes: [], waf: [] };
+  const ctx = { snapData: {}, abnormal: [], certs: [], probes: [], waf: [], segments: (cfg && cfg.segments) || undefined };
   try { const r = await kvGet(env,'an_snap'); if(r){ const s = JSON.parse(r); ctx.snapData = (s && s.data) || {}; } } catch(e){}
   try { const r = await kvGet(env,'cert_expiry'); if(r) ctx.certs = JSON.parse(r)||[]; } catch(e){}
   try { const r = await kvGet(env,'health_probe'); if(r) ctx.probes = JSON.parse(r)||[]; } catch(e){}
@@ -3256,6 +3269,16 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
         <label><input type="checkbox" id="tgAlerts" checked> 配额告警(50/80/95%)</label>
         <label><input type="checkbox" id="tgTraffic" checked> 流量突增/归零告警</label>
       </div>
+      <div style="margin-top:8px;display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+        <label style="display:flex;align-items:center;gap:6px;color:#475569">日报时段(北京时)：<select id="tgReportHour" class="input" style="width:auto"></select></label>
+        <span class="small" style="color:#94a3b8">每个整点后第 23 分触发；默认北京 7 点(=UTC 23)</span>
+      </div>
+      <div style="margin-top:6px;display:flex;gap:16px;flex-wrap:wrap;align-items:center;color:#475569">
+        <span>日报包含：</span>
+        <label><input type="checkbox" id="tgSegQuota" checked> 配额用量</label>
+        <label><input type="checkbox" id="tgSegTraffic" checked> 流量 / Zones</label>
+        <label><input type="checkbox" id="tgSegHealth" checked> 健康段(异常/证书/探活/WAF)</label>
+      </div>
       <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn primary" onclick="saveTGConfig()">保存配置</button>
         <button class="btn" onclick="testTG()">测试推送</button>
@@ -4484,6 +4507,16 @@ function renderStaticJS(env) {
         if (r.config.botTokenSet) el('tgBotToken').placeholder = '已保存 (' + r.config.botToken + ')';
         if (r.config.chatId) el('tgChatId').value = r.config.chatId;
         el('tgEnabled').checked = r.config.enabled !== false; el('tgDaily').checked = r.config.dailyReport !== false; el('tgAlerts').checked = r.config.alerts !== false; if (el('tgTraffic')) el('tgTraffic').checked = r.config.alertsTraffic !== false;
+        const uh = (r.config.reportHours && r.config.reportHours.length) ? r.config.reportHours[0] : 23;
+        const rhs = el('tgReportHour');
+        if (rhs) {
+          if (!rhs.options.length) { for (let bj = 6; bj <= 23; bj++) { const o = document.createElement('option'); o.value = String(bj); o.textContent = bj + ':23'; rhs.appendChild(o); } }
+          rhs.value = String((uh + 8) % 24);
+        }
+        const seg = r.config.segments || {};
+        if (el('tgSegQuota')) el('tgSegQuota').checked = seg.quota !== false;
+        if (el('tgSegTraffic')) el('tgSegTraffic').checked = seg.traffic !== false;
+        if (el('tgSegHealth')) el('tgSegHealth').checked = seg.health !== false;
       } } catch(e){}
       try { const r = await api('load-notify-config', {}); if (r && r.success && r.config) { fillNotifyConfig(r.config); } } catch(e){}
     }
@@ -5856,13 +5889,21 @@ window.refreshPagesManager=refreshPagesManager;window.deletePagesProject=deleteP
 
     function maskEmailFront(e){ const i = String(e||'').indexOf('@'); if(i <= 0) return e||''; const u = e.slice(0,i), d = e.slice(i+1); return (u.length <= 1 ? '*' : u.slice(0,1) + '***') + '@' + d; }
     async function saveTGConfig(){
+      const rhs = el('tgReportHour');
+      const uh = rhs && rhs.value !== '' ? ((Number(rhs.value) - 8 + 24) % 24) : 23;
       const config = {
         botToken: el('tgBotToken').value.trim(),
         chatId: el('tgChatId').value.trim(),
         enabled: el('tgEnabled').checked,
         dailyReport: el('tgDaily').checked,
         alerts: el('tgAlerts').checked,
-        alertsTraffic: !el('tgTraffic') || el('tgTraffic').checked
+        alertsTraffic: !el('tgTraffic') || el('tgTraffic').checked,
+        reportHours: [uh],
+        segments: {
+          quota: !el('tgSegQuota') || el('tgSegQuota').checked,
+          traffic: !el('tgSegTraffic') || el('tgSegTraffic').checked,
+          health: !el('tgSegHealth') || el('tgSegHealth').checked
+        }
       };
       const r = await api('save-tg-config', { config });
       if(r && r.success) showNotification('TG 配置已保存'); else showNotification((r&&r.error)||'保存失败','error');
