@@ -2825,7 +2825,7 @@ body.dark .domain-status.pending{background:rgba(245,158,11,0.18)}
       <div class="header">
         <div style="font-size:20px;font-weight:700">总览</div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <select id="dashScope" class="input" style="width:auto;max-width:260px" onchange="renderDashboard()"></select>
+          <select id="dashScope" class="input" style="width:auto;max-width:260px" onchange="dashScopeChanged()"></select>
           <button class="btn primary" id="dashCollectBtn" onclick="collectAnalyticsNow()">立即采集</button>
           <button class="btn" onclick="openAccountSwitcher()">切换执行账号</button>
         </div>
@@ -4175,7 +4175,9 @@ function renderStaticJS(env) {
       const acc = arr[idx];
       if (acc && acc.oauth) { localStorage.setItem('cf_active_oauth', acc.oauthId); localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); }
       else { localStorage.setItem('cf_active_email', acc.email); localStorage.setItem('cf_active_key', acc.key); localStorage.removeItem('cf_active_oauth'); }
-      localStorage.removeItem('cf_accountId'); showNotification('正在切换账号...'); setTimeout(() => location.reload(), 500);
+      localStorage.removeItem('cf_accountId');
+      const fkey = dashFollowKey(acc); if (fkey) localStorage.setItem('dash_scope', fkey);
+      showNotification('正在切换账号...'); setTimeout(() => location.reload(), 500);
     }
     function removeAccount(idx) {
       const arr0 = loadSaved(); const target = arr0[idx];
@@ -4249,6 +4251,21 @@ function renderStaticJS(env) {
       if (v >= 1e3) return (v / 1e3).toFixed(1) + 'k';
       return String(v);
     }
+    // 总览作用域：手动选择持久化 + 切执行账号跟随
+    function dashScopeChanged(){
+      const v = el('dashScope').value;
+      if (v) localStorage.setItem('dash_scope', v); else localStorage.removeItem('dash_scope');
+      renderDash();
+    }
+    function dashFollowKey(acc){ return (acc && (acc.email || acc.name || acc.oauthId)) || ''; }
+    function dashApplyScope(key){
+      const sel = el('dashScope');
+      if (!sel) return;
+      const ok = key && Array.from(sel.options).some(o => o.value === key);
+      if (ok) { sel.value = key; localStorage.setItem('dash_scope', key); }
+      else { sel.value = ''; localStorage.removeItem('dash_scope'); }
+      if (dashCache) renderDash();
+    }
     function dashScopeLabel(){
       const v = el('dashScope').value;
       if (!v) return '全部账号';
@@ -4280,6 +4297,8 @@ function renderStaticJS(env) {
       const sel = el('dashScope');
       if (sel && sel.options.length === 0) {
         sel.innerHTML = '<option value="">全部账号</option>' + arr.map(a => '<option value="' + escAttr(a.email || a.name || a.oauthId) + '">' + escAttr(a.oauth ? (a.name || a.oauthId) : a.email) + '</option>').join('');
+        const saved = localStorage.getItem('dash_scope') || '';
+        if (saved && Array.from(sel.options).some(o => o.value === saved)) sel.value = saved;
       }
       if (!dashCache) {
         const r = await api('get-dashboard', {});
@@ -4408,9 +4427,11 @@ function renderStaticJS(env) {
       if (i === -1) return showNotification('本地账号库未找到该账号，请先「从 KV 同步/账号库添加」', 'error');
       if (arr[i] && arr[i].oauth) { localStorage.setItem('cf_active_oauth', arr[i].oauthId); localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); }
       else { localStorage.setItem('cf_active_email', arr[i].email); localStorage.setItem('cf_active_key', arr[i].key); localStorage.removeItem('cf_active_oauth'); }
-      localStorage.removeItem('cf_accountId'); updateAcctBadge(); showNotification('已设为执行账号：' + emailKey);
+      localStorage.removeItem('cf_accountId'); updateAcctBadge();
+      dashApplyScope(emailKey);
+      showNotification('已设为执行账号：' + emailKey + '（总览已切到该账号）');
     }
-    window.renderDash = renderDash; window.collectAnalyticsNow = collectAnalyticsNow; window.openDashZones = openDashZones; window.dashSetActive = dashSetActive;
+    window.renderDash = renderDash; window.dashScopeChanged = dashScopeChanged; window.collectAnalyticsNow = collectAnalyticsNow; window.openDashZones = openDashZones; window.dashSetActive = dashSetActive;
     async function renderAccounts(){
       const arr = await kvMergeAccounts();
       const box = el('accountsBox'); if (!box) return;
@@ -4501,6 +4522,7 @@ function renderStaticJS(env) {
       if (acc && acc.oauth) { localStorage.setItem('cf_active_oauth', acc.oauthId); localStorage.removeItem('cf_active_email'); localStorage.removeItem('cf_active_key'); }
       else { localStorage.setItem('cf_active_email', acc.email); localStorage.setItem('cf_active_key', acc.key); localStorage.removeItem('cf_active_oauth'); }
       localStorage.removeItem('cf_accountId'); updateAcctBadge(); showNotification('已切换执行账号');
+      dashApplyScope(dashFollowKey(acc));
       renderAccounts();
     }
     // 构建日报时段多选 chips（北京时 06:23–23:23，18 档；UTC=北京-8）
