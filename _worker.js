@@ -1234,9 +1234,9 @@ case 'list-kv-namespaces': return json(await cfGet(`/accounts/${payload.accountI
       }
       case 'collect-analytics-now': {
         if (!env || !env.CF_ACCOUNTS_KV) return json({ success: false, error: 'CF_ACCOUNTS_KV 未绑定' });
-        const h = await storeAnalytics(env);        // 24h 快照（官方 1hGroups 直读）
+        const h = await storeAnalytics(env);        // 24h 快照（官方 1hGroups + 分布）
         const d = await storeOfficialAnalytics(env); // 官方按日 92 天直读
-        return json({ success: true, ok: h.ok + d.ok, fail: h.fail + d.fail });
+        return json({ success: true, hour: { ok: h.ok, fail: h.fail, diag: h.diag || [] }, daily: { ok: d.ok, fail: d.fail, diag: d.diag || [] } });
       }
 
       case 'backfill-usage-history': {
@@ -2105,7 +2105,7 @@ async function storeAnalytics(env){
   const st = new Date(now.getTime() - 24*3600*1000).toISOString();
   const et = now.toISOString();
   const date = et.slice(0,10);
-  const out = {}; let ok = 0, fail = 0;
+  const out = {}; const diagArr = []; let ok = 0, fail = 0;
   for(const c of creds){
     try {
       const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
@@ -2116,6 +2116,9 @@ async function storeAnalytics(env){
       const q = 'query($tag:String!,$st:Time!,$et:Time!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1hGroups(limit:24,filter:{datetime_geq:$st,datetime_leq:$et}){dimensions{datetimeHour}sum{requests bytes}uniq{uniques}}}}}}';
       const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId, st, et } }) });
       const res = await g.json();
+      let _anErr = '';
+      if (res && res.errors && res.errors.length) { try { _anErr = String((res.errors[0] && res.errors[0].message) || 'GraphQL errors').slice(0, 140); } catch(e){} }
+      else if (!res || !res.data || !res.data.viewer || !res.data.viewer.accounts || !res.data.viewer.accounts[0]) _anErr = 'GraphQL 返回为空结构';
       const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
       const zones = (acc && acc.zones) || [];
       const hourMap = {}; let req = 0, bytes = 0, uniq = 0;
@@ -2151,9 +2154,12 @@ async function storeAnalytics(env){
           out[email].countries = top(cmap, 8); out[email].statuses = top(smap, 8); out[email].colos = top(lmap, 8);
         }
       } catch(e){}
+      diagArr.push({ email, zones: zones.length, error: _anErr || '' });
       ok++;
     } catch(e){ fail++; }
   }
+  const diag = diagArr;
+  await kvPut(env, 'an_diag', { ts: et, kind: 'hourly', items: diag });
   await kvPut(env, 'an_snap', { ts: et, data: out });
   let daily = {}; try { const r = await kvGet(env, 'an_daily'); if(r) daily = JSON.parse(r) || {}; } catch(e){}
   const day = daily[date] || {};
@@ -2161,7 +2167,7 @@ async function storeAnalytics(env){
   daily[date] = day;
   const dkeys = Object.keys(daily).sort(); while(dkeys.length > 60) delete daily[dkeys.shift()];
   await kvPut(env, 'an_daily', daily);
-  return { ok, fail };
+  return { ok, fail, diag: diagArr };
 }
 
 // 官方按日直读：httpRequests1dGroups 免费计划可查 365 天，每账号一次 GraphQL 拉全部 zones
@@ -2172,7 +2178,7 @@ async function storeOfficialAnalytics(env, days = 92){
   const now = new Date();
   const le = now.toISOString().slice(0,10);
   const ge = new Date(now.getTime() - (days - 1) * 86400000).toISOString().slice(0,10);
-  let merged = null; let ok = 0, fail = 0;
+  const diagArr = []; let merged = null; let ok = 0, fail = 0;
   for(const c of creds){
     try {
       const email = c.email || c.name || ('acc-' + String(c.accountId || '').slice(0,6));
@@ -2183,6 +2189,9 @@ async function storeOfficialAnalytics(env, days = 92){
       const q = 'query($tag:String!){viewer{accounts(filter:{accountTag:$tag}){zones{name zoneTag httpRequests1dGroups(limit:30000,filter:{date_geq:"' + ge + '",date_leq:"' + le + '"}){dimensions{date}sum{requests bytes pageViews cachedRequests cachedBytes threats}uniq{uniques}}}}}}';
       const g = await fetch('https://api.cloudflare.com/client/v4/graphql', { method:'POST', headers: Object.assign({ 'Content-Type':'application/json' }, cfHeaders(email, key)), body: JSON.stringify({ query:q, variables:{ tag:accountId } }) });
       const res = await g.json();
+      let _anErr = '';
+      if (res && res.errors && res.errors.length) { try { _anErr = String((res.errors[0] && res.errors[0].message) || 'GraphQL errors').slice(0, 140); } catch(e){} }
+      else if (!res || !res.data || !res.data.viewer || !res.data.viewer.accounts || !res.data.viewer.accounts[0]) _anErr = 'GraphQL 返回为空结构';
       const acc = res && res.data && res.data.viewer && res.data.viewer.accounts && res.data.viewer.accounts[0];
       const zones = (acc && acc.zones) || [];
       const dayMap = {};
@@ -2203,6 +2212,7 @@ async function storeOfficialAnalytics(env, days = 92){
         const dayRec = merged.data[dt] = merged.data[dt] || {};
         dayRec[email] = Object.assign({ email }, dayMap[dt]);
       }
+      diagArr.push({ email, zones: (zones && zones.length) || 0, error: _anErr || '' });
       ok++;
     } catch(e){ fail++; }
   }
@@ -2212,7 +2222,8 @@ async function storeOfficialAnalytics(env, days = 92){
     if (keep.length < ds.length) { const drop = new Set(ds.slice(0, ds.length - keep.length)); for (const d of drop) delete merged.data[d]; }
     merged.fetchedAt = new Date().toISOString(); await kvPut(env, 'official_daily', merged);
   }
-  return { ok, fail };
+  try { await kvPut(env, 'an_diag_d', { ts: new Date().toISOString(), kind: 'daily', items: diagArr }); } catch(e){}
+  return { ok, fail, diag: diagArr };
 }
 
 // 配额/用量官方历史：workersInvocationsAdaptive 免费计划单次查询窗口 ≤1 天（date_geq/date_leq 同日）
@@ -4536,7 +4547,14 @@ function renderStaticJS(env) {
         dashCache = null;
         const d = await api('get-dashboard', {});
         dashCache = (d && d.success) ? d.dash : null;
-        showNotification('采集完成：成功 ' + r.ok + ' 个账号' + (r.fail ? '，失败 ' + r.fail + ' 个' : ''));
+        const hr = r.hour || {}, dl = r.daily || {};
+        const accN = Math.max(hr.ok || 0, dl.ok || 0);
+        const badN = Math.max(hr.fail || 0, dl.fail || 0);
+        let m = '采集完成：' + accN + ' 个账号（小时 ' + (hr.ok || 0) + ' · 官方日 ' + (dl.ok || 0) + '）';
+        const errs = (hr.diag || []).concat(dl.diag || []).filter(x => x && (x.error || !x.zones));
+        if (badN) m += '，失败 ' + badN + ' 个';
+        if (errs.length) { const f = errs[0]; m += '。诊断: zones=' + f.zones + (f.error ? ' · ' + f.error : ''); }
+        showNotification(m + (errs.length ? ' —— 若仍为 0，请把此条发我' : ''), errs.length ? 'error' : '');
         renderDash();
       } finally { if (btn) { btn.disabled = false; btn.textContent = '立即采集'; } }
     }
